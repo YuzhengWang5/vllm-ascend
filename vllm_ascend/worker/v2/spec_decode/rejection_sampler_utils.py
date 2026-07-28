@@ -21,16 +21,12 @@ import torch
 from vllm.triton_utils import tl, triton
 import vllm.v1.worker.gpu.spec_decode.rejection_sampler_utils as rejection_sampler_utils
 
-_compute_global_lse = getattr(
-    rejection_sampler_utils,
-    "_compute_global_logsumexp",
-    rejection_sampler_utils._compute_global_lse,
-)
-_compute_block_stats_kernel = getattr(
-    rejection_sampler_utils,
-    "_compute_local_logits_stats_kernel",
-    rejection_sampler_utils._compute_block_stats_kernel,
-)
+_compute_global_lse = getattr(rejection_sampler_utils, "_compute_global_logsumexp", None)
+if _compute_global_lse is None:
+    _compute_global_lse = rejection_sampler_utils._compute_global_lse
+_compute_block_stats_kernel = getattr(rejection_sampler_utils, "_compute_local_logits_stats_kernel", None)
+if _compute_block_stats_kernel is None:
+    _compute_block_stats_kernel = rejection_sampler_utils._compute_block_stats_kernel
 _insert_resampled_kernel = rejection_sampler_utils._insert_resampled_kernel
 
 
