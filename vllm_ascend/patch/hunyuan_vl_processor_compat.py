@@ -5,7 +5,10 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import Any
 
-from transformers import HunYuanVLProcessor
+try:
+    from transformers import HunYuanVLProcessor
+except ImportError:
+    HunYuanVLProcessor = None
 
 from vllm_ascend.utils import vllm_version_is
 
@@ -55,25 +58,31 @@ def _register_hunyuan_tokenizer_special_tokens(tokenizer: Any) -> None:
         )
 
 
-class _HunYuanVLProcessorCompat(HunYuanVLProcessor):
-    """Native processor with the legacy HunyuanOCR token schema restored."""
+if HunYuanVLProcessor is not None:
 
-    def __init__(
-        self,
-        image_processor: Any = None,
-        tokenizer: Any = None,
-        chat_template: Any = None,
-        cat_extra_token: bool = True,
-        **kwargs: Any,
-    ) -> None:
-        _register_hunyuan_tokenizer_special_tokens(tokenizer)
-        super().__init__(
-            image_processor=image_processor,
-            tokenizer=tokenizer,
-            chat_template=chat_template,
-            cat_extra_token=cat_extra_token,
-            **kwargs,
-        )
+    class _HunYuanVLProcessorCompat(HunYuanVLProcessor):
+        """Native processor with the legacy HunyuanOCR token schema restored."""
+
+        def __init__(
+            self,
+            image_processor: Any = None,
+            tokenizer: Any = None,
+            chat_template: Any = None,
+            cat_extra_token: bool = True,
+            **kwargs: Any,
+        ) -> None:
+            _register_hunyuan_tokenizer_special_tokens(tokenizer)
+            super().__init__(
+                image_processor=image_processor,
+                tokenizer=tokenizer,
+                chat_template=chat_template,
+                cat_extra_token=cat_extra_token,
+                **kwargs,
+            )
+else:
+
+    class _HunYuanVLProcessorCompat:
+        pass
 
 
 def _remove_stale_registry_entries() -> bool:
@@ -148,6 +157,9 @@ def _patch_image_token_wrapping(hunyuan_vision: Any) -> None:
 
 def install_hunyuan_vl_processor_compat() -> None:
     """Align both supported vLLM refs with Transformers 5.13 Hunyuan APIs."""
+    if HunYuanVLProcessor is None:
+        return
+
     _remove_stale_registry_entries()
     from vllm.model_executor.models import hunyuan_vision as main_hunyuan_vision
 

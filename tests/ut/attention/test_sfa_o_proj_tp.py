@@ -22,7 +22,7 @@ from tests.ut.base import TestBase
 if "torch_npu._inductor" not in sys.modules:
     sys.modules["torch_npu._inductor"] = MagicMock()
 
-from vllm_ascend.attention.sfa_v1 import AscendSFAImpl
+from vllm_ascend.attention.sfa_v1 import AscendSFAImpl, PreprocessType
 
 
 class TestAscendSFAOProjTPParams(TestBase):
@@ -108,6 +108,7 @@ class TestAscendSFAOProjTPParams(TestBase):
         impl.enable_dsa_cp_with_o_proj_tp = True
         impl.enable_sfa_prolog_v3 = False
         impl.enable_mlapo = False
+        impl.preprocess_type = PreprocessType.NATIVE
         impl.enable_sp = False
         impl.has_indexer = False
         impl.skip_topk = True

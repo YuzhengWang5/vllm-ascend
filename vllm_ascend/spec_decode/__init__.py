@@ -18,41 +18,49 @@
 #
 
 
-from vllm_ascend.spec_decode.dflash_proposer import AscendDflashProposer
-from vllm_ascend.spec_decode.draft_proposer import AscendDraftModelProposer
-from vllm_ascend.spec_decode.dspark_proposer import AscendDSparkProposer
-from vllm_ascend.spec_decode.eagle_proposer import AscendEagleProposer
-from vllm_ascend.spec_decode.extract_hidden_states_proposer import (
-    AscendExtractHiddenStatesProposer,
-)
-from vllm_ascend.spec_decode.medusa_proposer import AscendMedusaProposer
-from vllm_ascend.spec_decode.ngram_proposer import AscendNgramProposer
-from vllm_ascend.spec_decode.ngram_proposer_npu import AscendNgramProposerNPU
-from vllm_ascend.spec_decode.step3p5 import AscendStep3p5MTPProposer
-from vllm_ascend.spec_decode.suffix_proposer import AscendSuffixDecodingProposer
-
-
 def get_spec_decode_method(method, vllm_config, device, runner):
     if method == "ngram":
+        from vllm_ascend.spec_decode.ngram_proposer import AscendNgramProposer
+
         return AscendNgramProposer(vllm_config, runner)
     elif method == "ngram_gpu":
+        from vllm_ascend.spec_decode.ngram_proposer_npu import AscendNgramProposerNPU
+
         return AscendNgramProposerNPU(vllm_config, device, runner)
     elif method == "suffix":
+        from vllm_ascend.spec_decode.suffix_proposer import AscendSuffixDecodingProposer
+
         return AscendSuffixDecodingProposer(vllm_config, runner)
     elif method == "medusa":
+        from vllm_ascend.spec_decode.medusa_proposer import AscendMedusaProposer
+
         return AscendMedusaProposer(vllm_config, device)
     elif method == "dspark":
+        from vllm_ascend.spec_decode.dspark_proposer import AscendDSparkProposer
+
         return AscendDSparkProposer(vllm_config, device, runner)
     elif method in ("eagle", "eagle3", "mtp"):
         speculative_config = vllm_config.speculative_config
         if speculative_config is not None and speculative_config.use_step3p5_mtp():
+            from vllm_ascend.spec_decode.step3p5 import AscendStep3p5MTPProposer
+
             return AscendStep3p5MTPProposer(vllm_config, device, runner)
+        from vllm_ascend.spec_decode.eagle_proposer import AscendEagleProposer
+
         return AscendEagleProposer(vllm_config, device, runner)
     elif method == "dflash":
+        from vllm_ascend.spec_decode.dflash_proposer import AscendDflashProposer
+
         return AscendDflashProposer(vllm_config, device, runner)
     elif method == "draft_model":
+        from vllm_ascend.spec_decode.draft_proposer import AscendDraftModelProposer
+
         return AscendDraftModelProposer(vllm_config, device, runner)
     elif method == "extract_hidden_states":
+        from vllm_ascend.spec_decode.extract_hidden_states_proposer import (
+            AscendExtractHiddenStatesProposer,
+        )
+
         return AscendExtractHiddenStatesProposer(vllm_config, device, runner)
     else:
         raise ValueError(f"Unknown speculative decoding method: {method}")

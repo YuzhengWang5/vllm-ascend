@@ -26,7 +26,11 @@ from vllm.model_executor.models.deepseek_eagle3 import Eagle3DeepseekV2ForCausal
 from vllm.model_executor.models.deepseek_v2 import DeepseekV32IndexerCache
 from vllm.model_executor.models.llama_eagle3 import Eagle3LlamaForCausalLM
 from vllm.model_executor.models.qwen3_dflash import DFlashQwen3ForCausalLM
-from vllm.model_executor.models.qwen3_dspark import Qwen3DSparkForCausalLM
+try:
+    from vllm.model_executor.models.qwen3_dspark import Qwen3DSparkForCausalLM
+except ModuleNotFoundError:
+    class Qwen3DSparkForCausalLM:  # type: ignore[no-redef]
+        pass
 from vllm.triton_utils import HAS_TRITON, triton
 from vllm.utils.platform_utils import is_pin_memory_available
 from vllm.v1.attention.backends.utils import CommonAttentionMetadata

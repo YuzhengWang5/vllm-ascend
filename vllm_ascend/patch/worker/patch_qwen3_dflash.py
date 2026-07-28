@@ -68,7 +68,7 @@ def precompute_and_store_context_kv(
 
 DFlashQwen3Model.precompute_and_store_context_kv = precompute_and_store_context_kv
 
-_orig_read_mask_embedding = DFlashQwen3ForCausalLM._read_mask_embedding
+_orig_read_mask_embedding = getattr(DFlashQwen3ForCausalLM, "_read_mask_embedding", None)
 
 
 def _patched_read_mask_embedding(self):
@@ -78,4 +78,5 @@ def _patched_read_mask_embedding(self):
         return None
 
 
-DFlashQwen3ForCausalLM._read_mask_embedding = _patched_read_mask_embedding
+if _orig_read_mask_embedding is not None:
+    DFlashQwen3ForCausalLM._read_mask_embedding = _patched_read_mask_embedding
