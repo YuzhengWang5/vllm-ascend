@@ -51,3 +51,48 @@ vllm serve zai-org/GLM-5.2 \
         \"kv_connector_extra_config\": {\"use_layerwise\": true}
     }"
 ```
+
+## Single-host synthetic decode benchmark
+
+`SFAOffloadDecodeBenchConnector` is an experimental benchmark connector for
+isolating D-side sparse decode on one host. It uses the normal sparse-offload
+CPU main-KV pool and HBM indexer cache, but fills the prompt prefix with
+deterministic synthetic values instead of receiving it from a P node. It does
+not create a network peer.
+
+Use it only to measure decode-side compute and memory traffic. Generated
+tokens, top-k locality, P/D transfer latency, and end-to-end quality are not
+meaningful with synthetic KV.
+
+The connector requires `kv_role=kv_consumer`, sparse offload enabled, and
+`keep_device_kv_cache=false`:
+
+```bash
+vllm serve deepseek-ai/DeepSeek-V3.2 \
+    --enforce-eager \
+    --tensor-parallel-size 8 \
+    --max-model-len 65536 \
+    --additional-config '{
+        "sparse_kv_offload_config": {
+            "enabled": true,
+            "keep_device_kv_cache": false,
+            "dram_size_per_dp_GB": 512,
+            "topk_buffer_size": 4096
+        }
+    }' \
+    --kv-transfer-config '{
+        "kv_connector": "SFAOffloadDecodeBenchConnector",
+        "kv_role": "kv_consumer",
+        "kv_connector_extra_config": {
+            "main_fill_value": 0.015,
+            "indexer_fill_value": 1,
+            "indexer_scale_value": 0.015,
+            "fill_std": 0.0
+        }
+    }'
+```
+
+Submit a token-ID completion request with at least two prompt tokens. The
+connector marks every prompt token except the final token as externally
+computed, fills its block rows before the first decode forward, and then lets
+the normal selector, LRU, and sparse-onload path execute.
