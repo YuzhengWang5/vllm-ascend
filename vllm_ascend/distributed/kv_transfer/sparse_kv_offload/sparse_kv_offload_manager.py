@@ -324,10 +324,35 @@ class SparseKVOffloadManager:
         self.tp_rank = get_tensor_model_parallel_rank()
         self.tp_size = get_tensor_model_parallel_world_size()
         self.tp_group = get_tp_group()
+        self.dp_rank = parallel_config.data_parallel_rank
         self.block_size = self._infer_group_block_sizes(self.kv_cache_config)
         self.topk_buffer_size = sparse_kv_offload_config.topk_buffer_size
         self.topk = sparse_kv_offload_config.topk
         self.motivation_baseline = sparse_kv_offload_config.motivation_baseline
+        self.remote_indexer_client = None
+        if sparse_kv_offload_config.remote_indexer_enabled:
+            from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.remote_indexer import (
+                RemoteIndexerClient,
+            )
+
+            remote_rank = self.dp_rank * self.tp_size + self.tp_rank
+            remote_port = (
+                sparse_kv_offload_config.remote_indexer_base_port
+                + remote_rank
+            )
+            if remote_port > 65535:
+                raise ValueError(
+                    f"Remote indexer rank-local port is invalid: {remote_port}"
+                )
+            self.remote_indexer_client = RemoteIndexerClient(
+                host=sparse_kv_offload_config.remote_indexer_host,
+                port=remote_port,
+                rank=remote_rank,
+                topk=sparse_kv_offload_config.topk,
+                connect_timeout_s=(
+                    sparse_kv_offload_config.remote_indexer_connect_timeout_s
+                ),
+            )
 
         self.max_num_reqs = vllm_config.scheduler_config.max_num_seqs
         self.max_num_tokens = vllm_config.scheduler_config.max_num_batched_tokens
@@ -355,6 +380,10 @@ class SparseKVOffloadManager:
         self._npu_runtime = torch_npu.npu
 
         self._build_cpp()
+        if self.remote_indexer_client is not None:
+            self.remote_indexer_client.set_graph_callback_enqueuer(
+                self.sparse_kv_offload_cpp.enqueue_remote_indexer_subscribed_callback
+            )
 
         logger.info(
             "SparseKVOffloadManager start init CPU KV pool with %s "
@@ -775,6 +804,51 @@ class SparseKVOffloadManager:
                 f"num_tokens={num_tokens}, capacity={self.max_num_topk_rows}"
             )
         return self.motivation_oracle_topk_npu[:num_tokens].unsqueeze(1)
+
+    def remote_indexer_select(
+        self,
+        *,
+        layer_name: str,
+        q: torch.Tensor,
+        q_scale: torch.Tensor,
+        weights: torch.Tensor,
+        new_k: torch.Tensor,
+        new_k_scale: torch.Tensor,
+        slot_mapping: torch.Tensor,
+        actual_seq_lengths_query: torch.Tensor,
+        actual_seq_lengths_key: torch.Tensor,
+        block_table: torch.Tensor,
+        capturing: bool,
+    ) -> torch.Tensor:
+        if self.remote_indexer_client is None:
+            raise RuntimeError("Remote indexer client is not configured")
+        if capturing:
+            current_compute_stream = torch_npu.npu.current_stream()
+            subscribed_compute_streams = get_subscribed_compute_streams()
+            if current_compute_stream not in subscribed_compute_streams:
+                torch_npu.npu._subscribe_report(current_compute_stream)
+                subscribed_compute_streams.add(current_compute_stream)
+        return self.remote_indexer_client.select(
+            layer_id=self._get_offload_layer_id(layer_name),
+            q=q,
+            q_scale=q_scale,
+            weights=weights,
+            new_k=new_k,
+            new_k_scale=new_k_scale,
+            slot_mapping=slot_mapping,
+            actual_seq_lengths_query=actual_seq_lengths_query,
+            actual_seq_lengths_key=actual_seq_lengths_key,
+            block_table=block_table,
+            capturing=capturing,
+        )
+
+    def reset_remote_indexer_cache(self) -> None:
+        if self.remote_indexer_client is not None:
+            self.remote_indexer_client.reset_cache()
+
+    def fill_remote_indexer_blocks(self, block_ids: list[int]) -> None:
+        if self.remote_indexer_client is not None:
+            self.remote_indexer_client.fill_blocks(block_ids)
 
     def prepare_motivation_no_gather_buffers(self, fill_value: float) -> None:
         if self.motivation_baseline != "no_gather":

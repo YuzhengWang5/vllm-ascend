@@ -598,10 +598,15 @@ class AscendSFAImpl(MLAAttentionImpl):
             "motivation_force_oracle_trace",
             False,
         )
-        self.motivation_no_index_state = self.motivation_baseline in {
+        self.remote_indexer_enabled = getattr(
+            sparse_config,
+            "remote_indexer_enabled",
+            False,
+        )
+        self.omit_local_index_state = self.motivation_baseline in {
             "no_index_state",
             "no_gather",
-        }
+        } or self.remote_indexer_enabled
         if not self.has_indexer and not self.skip_topk:
             raise ValueError(
                 "Indexer is required for DSA unless skip_topk is enabled. "
@@ -640,6 +645,10 @@ class AscendSFAImpl(MLAAttentionImpl):
         # applies only to layers that own an indexer cache.
         self.enable_sparse_sfa_c8 = ascend_config.enable_sparse_sfa_c8
         self.enable_sparse_li_c8 = self.has_indexer and ascend_config.is_sparse_li_c8_layer(self.indexer.k_cache.prefix)
+        if self.remote_indexer_enabled and not self.enable_sparse_li_c8:
+            raise ValueError(
+                "Remote indexer v0 requires additional_config.enable_sparse_li_c8=True"
+            )
         if self.enable_sparse_sfa_c8 or self.enable_sparse_li_c8:
             if get_ascend_device_type() == AscendDeviceType.A5:
                 self.c8_k_cache_dtype = torch.float8_e4m3fn
@@ -1471,6 +1480,10 @@ class AscendSFAImpl(MLAAttentionImpl):
         sin: torch.Tensor,
         actual_seq_lengths_query: torch.Tensor,
         actual_seq_lengths_key: torch.Tensor,
+        new_k: torch.Tensor | None = None,
+        new_k_scale: torch.Tensor | None = None,
+        slot_mapping: torch.Tensor | None = None,
+        capturing: bool = False,
     ):
         if not self.has_indexer:
             raise RuntimeError(
@@ -1530,6 +1543,28 @@ class AscendSFAImpl(MLAAttentionImpl):
             q_li = q_li @ AscendSFAImpl.q_hadamard
             q_li, q_li_scale = torch_npu.npu_dynamic_quant(q_li.view(-1, self.head_dim), dst_type=self.c8_k_cache_dtype)
             q_li_scale = q_li_scale.to(self.c8_k_scale_cache_dtype)  # [b*s,]
+
+        if self.remote_indexer_enabled:
+            if q_li_scale is None or new_k is None or new_k_scale is None:
+                raise RuntimeError(
+                    "Remote indexer v0 requires quantized query/key scales"
+                )
+            if slot_mapping is None:
+                raise RuntimeError("Remote indexer v0 requires slot_mapping")
+            manager = get_sparse_kv_offload_manager()
+            return manager.remote_indexer_select(
+                layer_name=self.layer_name or "",
+                q=q_li.view(q_li_shape_ori),
+                q_scale=q_li_scale.view(q_li_shape_ori[:-1]),
+                weights=weights,
+                new_k=new_k,
+                new_k_scale=new_k_scale,
+                slot_mapping=slot_mapping,
+                actual_seq_lengths_query=actual_seq_lengths_query,
+                actual_seq_lengths_key=actual_seq_lengths_key,
+                block_table=attn_metadata.block_table,
+                capturing=capturing,
+            )
 
         return DeviceOperator.indexer_select_post_process(
             self,
@@ -1811,7 +1846,7 @@ class AscendSFAImpl(MLAAttentionImpl):
         main_cache = kv_cache
         if main_cache is None or not self.has_indexer:
             return main_cache
-        if self.motivation_no_index_state:
+        if self.omit_local_index_state:
             return main_cache
 
         # Sparse KV offload registers the main MLA cache as a 6-tuple
@@ -2005,6 +2040,7 @@ class AscendSFAImpl(MLAAttentionImpl):
             kv_cache is not None
             and self.has_indexer
             and not self.motivation_use_oracle_topk
+            and not self.remote_indexer_enabled
         ):
             assert k_li is not None
             use_li_c8_reshape_optim = self._use_li_c8_reshape_optim()
@@ -2078,6 +2114,10 @@ class AscendSFAImpl(MLAAttentionImpl):
                 sin=sin,
                 actual_seq_lengths_query=actual_seq_lengths_query,
                 actual_seq_lengths_key=actual_seq_lengths_key,
+                new_k=k_li,
+                new_k_scale=k_li_scale,
+                slot_mapping=slot_mapping,
+                capturing=getattr(self, "_in_graph_runtime", lambda: False)(),
             )
             # Motivation runs execute the real index scan/score/top-k above,
             # then replace its output with the same deterministic trace used

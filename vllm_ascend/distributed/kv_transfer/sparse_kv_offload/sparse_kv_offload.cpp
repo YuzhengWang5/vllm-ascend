@@ -35,6 +35,46 @@
 
 constexpr int32_t EPOCH_RESET_THRESHOLD = 1 << 30;
 
+struct RemoteIndexerCallbackPayload {
+  int64_t rank;
+  int64_t layer_id;
+};
+
+void remote_indexer_callback(void* raw_payload) {
+  // ACLGraph retains and replays the same callback payload.  Keep this object
+  // alive for the graph lifetime, just like vLLM Ascend's device_print helper.
+  auto* payload = static_cast<RemoteIndexerCallbackPayload*>(raw_payload);
+  if (payload == nullptr) {
+    return;
+  }
+
+  const PyGILState_STATE gil = PyGILState_Ensure();
+  try {
+    pybind11::module_::import(
+        "vllm_ascend.distributed.kv_transfer.sparse_kv_offload.remote_indexer")
+        .attr("_run_graph_callback")(payload->rank, payload->layer_id);
+  } catch (const pybind11::error_already_set& error) {
+    std::cerr << "Remote indexer ACLGraph callback failed: " << error.what()
+              << std::endl;
+    PyErr_Clear();
+  }
+  PyGILState_Release(gil);
+}
+
+void enqueue_remote_indexer_subscribed_callback(const int64_t rank,
+                                                const int64_t layer_id) {
+  aclrtStream stream = c10_npu::getCurrentNPUStream().stream();
+  auto* payload = new RemoteIndexerCallbackPayload{rank, layer_id};
+  const aclError ret = aclrtLaunchCallback(
+      remote_indexer_callback, payload, ACL_CALLBACK_BLOCK, stream);
+  if (ret != ACL_SUCCESS) {
+    delete payload;
+  }
+  TORCH_CHECK(ret == ACL_SUCCESS,
+              "aclrtLaunchCallback on subscribed stream failed, error code: ",
+              ret);
+}
+
 FORCE_INLINE int choose_lru_resident_threads(const int num_reqs, const int workspace_threads,
                                              const int requested_threads) {
   if (num_reqs <= 1) {
@@ -333,4 +373,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         "CPU LRU resident compact miss prepare with OpenMP row-level parallelism");
   m.def("compute_lru_resident_addrs", &compute_lru_resident_addrs,
         "Compute sparse H2D metadata for compact LRU resident miss loads");
+  m.def("enqueue_remote_indexer_subscribed_callback",
+        &enqueue_remote_indexer_subscribed_callback,
+        "Enqueue a remote indexer callback on a pre-subscribed stream");
 }

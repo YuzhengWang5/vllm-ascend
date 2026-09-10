@@ -42,7 +42,12 @@ _ORIGINAL_INDEXER_GET_KV_CACHE_SPEC = DeepseekV32IndexerCache.get_kv_cache_spec
 def _indexer_get_kv_cache_spec(self, vllm_config: VllmConfig):
     sparse_config = get_ascend_config().sparse_kv_offload_config
     baseline = getattr(sparse_config, "motivation_baseline", "colocated")
-    if baseline in {"no_index_state", "no_gather"}:
+    remote_indexer_enabled = getattr(
+        sparse_config,
+        "remote_indexer_enabled",
+        False,
+    )
+    if baseline in {"no_index_state", "no_gather"} or remote_indexer_enabled:
         return None
     return _ORIGINAL_INDEXER_GET_KV_CACHE_SPEC(self, vllm_config)
 

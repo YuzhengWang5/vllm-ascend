@@ -1044,6 +1044,16 @@ class SparseKVOffloadConfig:
         self.motivation_force_oracle_trace = bool(
             user_config.get("motivation_force_oracle_trace", False)
         )
+        self.remote_indexer_host = str(
+            user_config.get("remote_indexer_host", "")
+        )
+        self.remote_indexer_base_port = int(
+            user_config.get("remote_indexer_base_port", 26000)
+        )
+        self.remote_indexer_connect_timeout_s = float(
+            user_config.get("remote_indexer_connect_timeout_s", 30.0)
+        )
+        self.remote_indexer_enabled = bool(self.remote_indexer_host)
         supported_motivation_baselines = {
             "colocated",
             "no_index_compute",
@@ -1055,6 +1065,22 @@ class SparseKVOffloadConfig:
                 "sparse_kv_offload_config.motivation_baseline must be one of "
                 f"{sorted(supported_motivation_baselines)}, got "
                 f"{self.motivation_baseline!r}"
+            )
+        if not 1 <= self.remote_indexer_base_port <= 65520:
+            raise ValueError(
+                "sparse_kv_offload_config.remote_indexer_base_port must leave "
+                "room for rank-local ports, got "
+                f"{self.remote_indexer_base_port}"
+            )
+        if self.remote_indexer_connect_timeout_s <= 0:
+            raise ValueError(
+                "sparse_kv_offload_config.remote_indexer_connect_timeout_s "
+                "must be positive"
+            )
+        if self.remote_indexer_enabled and self.motivation_baseline != "colocated":
+            raise ValueError(
+                "Remote indexer must use motivation_baseline='colocated'; "
+                "motivation ablations cannot be combined with a real service"
             )
 
         if hasattr(vllm_config.model_config.hf_text_config, "compress_ratios"):

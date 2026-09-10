@@ -4888,7 +4888,15 @@ class NPUModelRunner(GPUModelRunner):
                     "motivation_baseline",
                     "colocated",
                 )
-                if motivation_baseline in {"no_index_state", "no_gather"}:
+                remote_indexer_enabled = getattr(
+                    self.ascend_config.sparse_kv_offload_config,
+                    "remote_indexer_enabled",
+                    False,
+                )
+                if (
+                    motivation_baseline in {"no_index_state", "no_gather"}
+                    or remote_indexer_enabled
+                ):
                     continue
                 # TODO: This mirrors upstream's separated KV/indexer specs for
                 # SFA, but keeps Ascend-specific shape/block-size accounting.
@@ -5016,6 +5024,16 @@ class NPUModelRunner(GPUModelRunner):
         parent_module_name = _get_gpu_model_runner_module_name(self)
         with _torch_cuda_wrapper(), _replace_gpu_model_runner_function_wrapper(parent_module_name):
             cuda_graph_size = GPUModelRunner.capture_model(self)
+            if self.sparse_kv_offload_config.remote_indexer_enabled:
+                from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.sparse_kv_offload_manager import (
+                    get_sparse_kv_offload_manager,
+                )
+
+                # Full graph capture executes the model once and therefore
+                # writes dummy K values into the remote index cache.  The
+                # local cache is subsequently initialized by the connector;
+                # restore the remote cache to the same initial state here.
+                get_sparse_kv_offload_manager().reset_remote_indexer_cache()
 
         mgr = self.encoder_cudagraph_manager
         if mgr is not None and hasattr(self, "update_stream"):

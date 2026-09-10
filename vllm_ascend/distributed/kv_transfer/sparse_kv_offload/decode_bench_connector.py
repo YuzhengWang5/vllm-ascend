@@ -219,7 +219,10 @@ class SFAOffloadDecodeBenchWorker:
             total_blocks += len(block_ids)
             total_tokens += metadata.reqs_to_fill[request_id][1]
             self._fill_main_cpu_pool(block_ids)
-            self._fill_indexer_hbm(block_ids)
+            if self.manager.remote_indexer_client is not None:
+                self.manager.fill_remote_indexer_blocks(block_ids)
+            else:
+                self._fill_indexer_hbm(block_ids)
 
         self.manager.prepare_motivation_no_gather_buffers(
             self.main_fill_value,
