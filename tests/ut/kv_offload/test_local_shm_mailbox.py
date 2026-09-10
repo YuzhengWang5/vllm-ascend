@@ -9,7 +9,12 @@ from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.local_shm_mailbox imp
 )
 from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.memfabric_mailbox import (
     _REQUEST_HEADER,
+    MAILBOX_POOL_BYTES,
+    PAYLOAD_OFFSET,
+    MemfabricMailboxServer,
+    _copy_tensor_bytes,
     _request_specs,
+    request_header,
 )
 
 
@@ -108,3 +113,63 @@ def test_local_shm_mailbox_packed_round_trip(tmp_path):
 
     client.close()
     server.close(unlink=True)
+
+
+def test_memfabric_server_returns_mapped_tensor_views():
+    backing = (ctypes.c_ubyte * MAILBOX_POOL_BYTES)()
+    server = MemfabricMailboxServer.__new__(MemfabricMailboxServer)
+    server.local_va = ctypes.addressof(backing)
+    server._last_sequence = 0
+    server._mapped_views = {}
+    request = _request()
+    header = request_header(11, 9, request)
+    ctypes.memmove(server.local_va, header, len(header))
+    values = _REQUEST_HEADER.unpack(header)
+    total, specs = _request_specs(values[2:])
+    offset = 0
+    for name, _shape, _dtype, size in specs:
+        _copy_tensor_bytes(
+            server.local_va + PAYLOAD_OFFSET + offset,
+            request[name],
+            size,
+        )
+        offset += size
+    assert offset == total
+
+    observed = server.try_receive_views()
+
+    assert observed is not None
+    assert observed["request_id"] == 11
+    assert observed["layer_id"] == 9
+    for name, expected in request.items():
+        assert torch.equal(observed[name], expected)
+    assert observed["q"].data_ptr() == server.local_va + PAYLOAD_OFFSET
+
+    request["q"][0, 0, 0] = -7
+    ctypes.memmove(
+        server.local_va + PAYLOAD_OFFSET,
+        request["q"].data_ptr(),
+        request["q"].numel(),
+    )
+    assert observed["q"][0, 0, 0].item() == -7
+
+
+def test_memfabric_response_writes_directly_from_output():
+    server = MemfabricMailboxServer.__new__(MemfabricMailboxServer)
+    server.peer_gva = 4096
+    writes = []
+    publications = []
+    server._remote_write = lambda source, destination, size: writes.append((source, destination, size))
+    server._publish_response = lambda sequence, ok: publications.append((sequence, ok))
+    output = torch.arange(16, dtype=torch.int32).reshape(2, 1, 8)
+
+    server.respond(13, output)
+
+    assert writes == [
+        (
+            output.data_ptr(),
+            server.peer_gva + PAYLOAD_OFFSET,
+            output.numel() * output.element_size(),
+        )
+    ]
+    assert publications == [(13, True)]

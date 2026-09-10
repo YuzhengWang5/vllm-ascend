@@ -296,7 +296,30 @@ class MemfabricMailboxServer(_MailboxBase):
     def __init__(self, **kwargs: Any) -> None:
         super().__init__(bm_rank=1, **kwargs)
         self._last_sequence = 0
-        self._response_payload = torch.empty(1, dtype=torch.uint8)
+        self._mapped_views: dict[
+            tuple[int, tuple[int, ...], torch.dtype],
+            tuple[Any, torch.Tensor],
+        ] = {}
+
+    def _mapped_tensor(
+        self,
+        offset: int,
+        shape: tuple[int, ...],
+        dtype: torch.dtype,
+        size: int,
+    ) -> torch.Tensor:
+        key = (offset, shape, dtype)
+        cached = self._mapped_views.get(key)
+        if cached is None:
+            raw_buffer = (ctypes.c_ubyte * size).from_address(self.local_va + PAYLOAD_OFFSET + offset)
+            tensor = torch.frombuffer(
+                raw_buffer,
+                dtype=dtype,
+                count=size // torch.empty((), dtype=dtype).element_size(),
+            ).reshape(shape)
+            cached = (raw_buffer, tensor)
+            self._mapped_views[key] = cached
+        return cached[1]
 
     def try_receive(
         self,
@@ -326,15 +349,38 @@ class MemfabricMailboxServer(_MailboxBase):
             **tensors,
         }
 
+    def try_receive_views(self) -> dict[str, Any] | None:
+        """Return CPU tensors that directly view the mapped request payload."""
+        sequence = ctypes.c_uint64.from_address(self.local_va + REQUEST_HEADER_OFFSET).value
+        if sequence == self._last_sequence:
+            return None
+        raw_header = (ctypes.c_ubyte * _REQUEST_HEADER.size).from_address(self.local_va + REQUEST_HEADER_OFFSET)
+        values = _REQUEST_HEADER.unpack_from(raw_header)
+        request_id, layer_id = values[:2]
+        if request_id != sequence:
+            return None
+        total, specs = _request_specs(values[2:])
+        tensors = {}
+        offset = 0
+        for name, shape, dtype, size in specs:
+            tensors[name] = self._mapped_tensor(offset, shape, dtype, size)
+            offset += size
+        assert offset == total
+        self._last_sequence = sequence
+        return {
+            "request_id": request_id,
+            "layer_id": layer_id,
+            **tensors,
+        }
+
     def respond(self, sequence: int, output: torch.Tensor) -> None:
         size = output.numel() * output.element_size()
         if PAYLOAD_OFFSET + size > MAILBOX_POOL_BYTES:
             raise ValueError("MemFabric response payload exceeds mailbox pool")
-        if self._response_payload.numel() < size:
-            self._response_payload = torch.empty(size, dtype=torch.uint8)
-        ctypes.memmove(self._response_payload.data_ptr(), output.data_ptr(), size)
+        if output.device.type != "cpu" or not output.is_contiguous():
+            raise ValueError("MemFabric response requires a contiguous CPU tensor")
         self._remote_write(
-            self._response_payload.data_ptr(),
+            output.data_ptr(),
             self.peer_gva + PAYLOAD_OFFSET,
             size,
         )

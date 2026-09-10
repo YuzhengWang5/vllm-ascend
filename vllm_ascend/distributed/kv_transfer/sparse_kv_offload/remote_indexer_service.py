@@ -157,7 +157,15 @@ class RemoteIndexerWorker:
         key = (name, shape, dtype)
         buffer = self.host_buffers.get(key)
         if buffer is None:
-            buffer = torch.empty(shape, dtype=dtype, device="cpu", pin_memory=True)
+            # MemFabric H2G accepts ordinary host memory, not torch pinned
+            # allocations.  Keep request staging pinned, but make the response
+            # buffer directly publishable without an intermediate memcpy.
+            buffer = torch.empty(
+                shape,
+                dtype=dtype,
+                device="cpu",
+                pin_memory=name != "topk_response",
+            )
             self.host_buffers[key] = buffer
         return buffer
 
@@ -309,7 +317,7 @@ def _serve_memfabric(
                 raise RuntimeError("MemFabric hot path accepts only TCP control messages")
             _handle_control(worker, connection, recv_framed(connection))
             continue
-        request = mailbox.try_receive(worker.host_buffer)
+        request = mailbox.try_receive_views()
         if request is None:
             continue
         request_id = int(request["request_id"])
