@@ -152,24 +152,21 @@ def _serve_decoder(
             if readable:
                 kind = _recv_exact(inbound, 1)
             else:
-                request = local_mailbox.try_receive(buffers.get)
+                request = local_mailbox.try_receive_packed()
                 if request is None:
                     continue
                 request_id = int(request["request_id"])
                 try:
                     started_at = time.perf_counter()
-                    output = buffers.get(
-                        "topk_response",
-                        (request["q"].shape[0], 1, topk),
-                        torch.int32,
-                    )
-                    mailbox.select(
+                    response_bytes = int(request["tokens"]) * topk * 4
+                    mailbox.select_from_address(
                         request_id,
-                        int(request["layer_id"]),
-                        request,
-                        output,
+                        request["header"],
+                        int(request["payload_address"]),
+                        local_mailbox.response_payload_address,
+                        response_bytes,
                     )
-                    local_mailbox.respond(request_id, output)
+                    local_mailbox.publish_response(request_id)
                     if request_id % log_every == 0:
                         print(
                             json.dumps(
@@ -179,7 +176,8 @@ def _serve_decoder(
                                     "rank": rank,
                                     "request_id": request_id - 1,
                                     "layer_id": int(request["layer_id"]),
-                                    "tokens": request["q"].shape[0],
+                                    "tokens": int(request["tokens"]),
+                                    "relay_path": "zero_copy",
                                     "elapsed_ms": (time.perf_counter() - started_at) * 1000,
                                 }
                             ),

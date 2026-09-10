@@ -1,3 +1,4 @@
+import ctypes
 import threading
 
 import torch
@@ -5,6 +6,10 @@ import torch
 from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.local_shm_mailbox import (
     LocalShmMailboxClient,
     LocalShmMailboxServer,
+)
+from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.memfabric_mailbox import (
+    _REQUEST_HEADER,
+    _request_specs,
 )
 
 
@@ -60,6 +65,45 @@ def test_local_shm_mailbox_round_trip(tmp_path):
     assert observed_request["layer_id"] == 4
     for name, value in request.items():
         assert torch.equal(observed_request[name], value)
+    assert torch.equal(output, expected)
+
+    client.close()
+    server.close(unlink=True)
+
+
+def test_local_shm_mailbox_packed_round_trip(tmp_path):
+    path = str(tmp_path / "packed-indexer.mailbox")
+    server = LocalShmMailboxServer(path, timeout_s=2.0)
+    client = LocalShmMailboxClient(path, timeout_s=2.0)
+    expected = torch.arange(16, dtype=torch.int32).reshape(2, 1, 8)
+    observed = {}
+
+    def serve_once():
+        while not observed:
+            request = server.try_receive_packed()
+            if request is not None:
+                observed.update(request)
+        ctypes.memmove(
+            server.response_payload_address,
+            expected.data_ptr(),
+            expected.numel() * expected.element_size(),
+        )
+        server.publish_response(observed["request_id"])
+
+    thread = threading.Thread(target=serve_once)
+    thread.start()
+    output = torch.empty_like(expected)
+    request = _request()
+    client.select(3, 7, request, output)
+    thread.join(timeout=2.0)
+
+    assert not thread.is_alive()
+    assert observed["request_id"] == 3
+    assert observed["layer_id"] == 7
+    assert observed["tokens"] == 2
+    header_values = _REQUEST_HEADER.unpack(observed["header"])
+    expected_bytes, _ = _request_specs(header_values[2:])
+    assert observed["payload_bytes"] == expected_bytes
     assert torch.equal(output, expected)
 
     client.close()

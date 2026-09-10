@@ -163,16 +163,36 @@ class LocalShmMailboxServer(_LocalShmMailbox):
             **tensors,
         }
 
-    def respond(self, sequence: int, output: torch.Tensor) -> None:
-        size = output.numel() * output.element_size()
-        if RESPONSE_PAYLOAD_OFFSET + size > SHM_BYTES:
-            raise ValueError("Shared-memory response exceeds its mailbox slot")
-        ctypes.memmove(
-            self._address + RESPONSE_PAYLOAD_OFFSET,
-            output.data_ptr(),
-            size,
-        )
-        header = _RESPONSE_HEADER.pack(sequence, 1)
+    def try_receive_packed(self) -> dict[str, Any] | None:
+        """Return raw request addresses for a zero-copy relay hot path."""
+        sequence = ctypes.c_uint64.from_address(self._address + REQUEST_HEADER_OFFSET).value
+        if sequence == self._last_sequence:
+            return None
+        raw_header = (ctypes.c_ubyte * _REQUEST_HEADER.size).from_address(self._address + REQUEST_HEADER_OFFSET)
+        header = bytes(raw_header)
+        values = _REQUEST_HEADER.unpack(header)
+        request_id, layer_id = values[:2]
+        if request_id != sequence:
+            return None
+        total, _ = _request_specs(values[2:])
+        if REQUEST_PAYLOAD_OFFSET + total > RESPONSE_PAYLOAD_OFFSET:
+            raise ValueError("Shared-memory request exceeds its mailbox slot")
+        self._last_sequence = sequence
+        return {
+            "request_id": request_id,
+            "layer_id": layer_id,
+            "tokens": values[2],
+            "header": header,
+            "payload_address": self._address + REQUEST_PAYLOAD_OFFSET,
+            "payload_bytes": total,
+        }
+
+    @property
+    def response_payload_address(self) -> int:
+        return self._address + RESPONSE_PAYLOAD_OFFSET
+
+    def publish_response(self, sequence: int, ok: bool = True) -> None:
+        header = _RESPONSE_HEADER.pack(sequence, int(ok))
         ctypes.memmove(
             self._address + RESPONSE_HEADER_OFFSET + 8,
             header[8:],
@@ -183,9 +203,16 @@ class LocalShmMailboxServer(_LocalShmMailbox):
             sequence,
         )
 
-    def respond_error(self, sequence: int) -> None:
-        ctypes.c_uint64.from_address(self._address + RESPONSE_HEADER_OFFSET + 8).value = 0
-        self._publish_sequence(
-            self._address + RESPONSE_HEADER_OFFSET,
-            sequence,
+    def respond(self, sequence: int, output: torch.Tensor) -> None:
+        size = output.numel() * output.element_size()
+        if RESPONSE_PAYLOAD_OFFSET + size > SHM_BYTES:
+            raise ValueError("Shared-memory response exceeds its mailbox slot")
+        ctypes.memmove(
+            self._address + RESPONSE_PAYLOAD_OFFSET,
+            output.data_ptr(),
+            size,
         )
+        self.publish_response(sequence)
+
+    def respond_error(self, sequence: int) -> None:
+        self.publish_response(sequence, ok=False)

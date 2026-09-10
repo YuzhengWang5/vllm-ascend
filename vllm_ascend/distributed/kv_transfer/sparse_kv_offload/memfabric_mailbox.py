@@ -247,6 +247,37 @@ class MemfabricMailboxClient(_MailboxBase):
         self._remote_write(self._packed.data_ptr(), self.peer_gva + PAYLOAD_OFFSET, total)
         self._publish_request_header(header)
 
+        self._wait_response(sequence)
+        output_bytes = output.numel() * output.element_size()
+        if PAYLOAD_OFFSET + output_bytes > MAILBOX_POOL_BYTES:
+            raise ValueError("MemFabric response payload exceeds mailbox pool")
+        ctypes.memmove(output.data_ptr(), self.local_va + PAYLOAD_OFFSET, output_bytes)
+
+    def select_from_address(
+        self,
+        sequence: int,
+        header: bytes,
+        payload_address: int,
+        response_address: int,
+        response_bytes: int,
+    ) -> None:
+        """Forward an already packed host request without tensor unpack/repack."""
+        values = _REQUEST_HEADER.unpack(header)
+        if values[0] != sequence:
+            raise ValueError(f"MemFabric sequence mismatch: expected={sequence}, header={values[0]}")
+        total, _ = _request_specs(values[2:])
+        self._remote_write(payload_address, self.peer_gva + PAYLOAD_OFFSET, total)
+        self._publish_request_header(header)
+        self._wait_response(sequence)
+        if PAYLOAD_OFFSET + response_bytes > MAILBOX_POOL_BYTES:
+            raise ValueError("MemFabric response payload exceeds mailbox pool")
+        ctypes.memmove(
+            response_address,
+            self.local_va + PAYLOAD_OFFSET,
+            response_bytes,
+        )
+
+    def _wait_response(self, sequence: int) -> None:
         response_sequence = ctypes.c_uint64.from_address(self.local_va + RESPONSE_HEADER_OFFSET)
         deadline = time.monotonic() + self.timeout_s
         while response_sequence.value != sequence:
@@ -259,10 +290,6 @@ class MemfabricMailboxClient(_MailboxBase):
         )
         if not ok:
             raise RuntimeError(f"Remote MemFabric indexer failed: sequence={sequence}")
-        output_bytes = output.numel() * output.element_size()
-        if PAYLOAD_OFFSET + output_bytes > MAILBOX_POOL_BYTES:
-            raise ValueError("MemFabric response payload exceeds mailbox pool")
-        ctypes.memmove(output.data_ptr(), self.local_va + PAYLOAD_OFFSET, output_bytes)
 
 
 class MemfabricMailboxServer(_MailboxBase):
