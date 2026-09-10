@@ -336,21 +336,20 @@ class SparseKVOffloadManager:
             )
 
             remote_rank = self.dp_rank * self.tp_size + self.tp_rank
-            remote_port = (
-                sparse_kv_offload_config.remote_indexer_base_port
-                + remote_rank
-            )
+            remote_port = sparse_kv_offload_config.remote_indexer_base_port + remote_rank
             if remote_port > 65535:
-                raise ValueError(
-                    f"Remote indexer rank-local port is invalid: {remote_port}"
-                )
+                raise ValueError(f"Remote indexer rank-local port is invalid: {remote_port}")
             self.remote_indexer_client = RemoteIndexerClient(
                 host=sparse_kv_offload_config.remote_indexer_host,
                 port=remote_port,
                 rank=remote_rank,
                 topk=sparse_kv_offload_config.topk,
-                connect_timeout_s=(
-                    sparse_kv_offload_config.remote_indexer_connect_timeout_s
+                connect_timeout_s=(sparse_kv_offload_config.remote_indexer_connect_timeout_s),
+                transport=sparse_kv_offload_config.remote_indexer_transport,
+                memfabric_store_url=(
+                    "tcp://"
+                    f"{sparse_kv_offload_config.remote_indexer_memfabric_store_host}:"
+                    f"{sparse_kv_offload_config.remote_indexer_memfabric_store_base_port + remote_rank}"
                 ),
             )
 
@@ -548,11 +547,15 @@ class SparseKVOffloadManager:
             dtype=torch.int32,
             device=device,
         )
-        self.motivation_oracle_topk_npu = torch.arange(
-            self.topk,
-            dtype=torch.int32,
-            device=device,
-        ).view(1, -1).repeat(self.max_num_topk_rows, 1)
+        self.motivation_oracle_topk_npu = (
+            torch.arange(
+                self.topk,
+                dtype=torch.int32,
+                device=device,
+            )
+            .view(1, -1)
+            .repeat(self.max_num_topk_rows, 1)
+        )
         self.current_slots_npu.copy_(self.motivation_oracle_topk_npu)
         self.resident_block_table_npu = torch.arange(
             self.max_num_topk_rows * pages_per_row,

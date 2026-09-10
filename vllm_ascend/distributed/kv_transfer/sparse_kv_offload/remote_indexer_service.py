@@ -3,13 +3,15 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import os
-from pathlib import Path
+import select as io_select
 import signal
 import socket
 import time
 import traceback
+from pathlib import Path
 
 import torch
 import torch_npu
@@ -51,9 +53,7 @@ class RemoteIndexerWorker:
         self.indexer_scale_value = indexer_scale_value
         self.profile_dir = profile_dir
         self.caches: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
-        self.host_buffers: dict[
-            tuple[str, tuple[int, ...], torch.dtype], torch.Tensor
-        ] = {}
+        self.host_buffers: dict[tuple[str, tuple[int, ...], torch.dtype], torch.Tensor] = {}
         self._profiler = None
         self._profile_active = False
         self._profile_start_requested = False
@@ -174,12 +174,9 @@ class RemoteIndexerWorker:
             return
         if min(block_ids) < 0 or max(block_ids) >= self.cache_blocks:
             raise ValueError(
-                f"Remote index cache block ids out of range: {block_ids!r}, "
-                f"cache_blocks={self.cache_blocks}"
+                f"Remote index cache block ids out of range: {block_ids!r}, cache_blocks={self.cache_blocks}"
             )
-        indices = torch.tensor(
-            sorted(set(block_ids)), dtype=torch.long, device="npu"
-        )
+        indices = torch.tensor(sorted(set(block_ids)), dtype=torch.long, device="npu")
         for key, scale in self.caches.values():
             key_values = torch.full(
                 (len(indices), *key.shape[1:]),
@@ -251,7 +248,93 @@ class RemoteIndexerWorker:
             sparse_count=self.topk,
             sparse_mode=3,
         )
-        return topk.cpu()
+        output = self.host_buffer("topk_response", tuple(topk.shape), topk.dtype)
+        output.copy_(topk)
+        return output
+
+
+def _handle_control(
+    worker: RemoteIndexerWorker,
+    connection: socket.socket,
+    request: dict,
+) -> None:
+    if request.get("rank") != worker.rank:
+        raise RuntimeError(f"Request rank mismatch: expected={worker.rank}, got={request.get('rank')}")
+    if request.get("op") == "reset_cache":
+        worker.reset_cache()
+        send_framed(connection, {"ok": True, "op": "reset_cache"})
+        print(
+            json.dumps(
+                {
+                    "event": "cache_reset",
+                    "rank": worker.rank,
+                    "layers": len(worker.caches),
+                }
+            ),
+            flush=True,
+        )
+        return
+    if request.get("op") == "fill_blocks":
+        block_ids = request.get("block_ids")
+        if not isinstance(block_ids, list):
+            raise TypeError("fill_blocks requires a block_ids list")
+        worker.fill_blocks(block_ids)
+        send_framed(connection, {"ok": True, "op": "fill_blocks"})
+        print(
+            json.dumps(
+                {
+                    "event": "blocks_filled",
+                    "rank": worker.rank,
+                    "blocks": len(set(block_ids)),
+                    "layers": len(worker.caches),
+                }
+            ),
+            flush=True,
+        )
+        return
+    raise RuntimeError(f"Unsupported control request: {request.get('op')!r}")
+
+
+def _serve_memfabric(
+    worker: RemoteIndexerWorker,
+    connection: socket.socket,
+    mailbox,
+    log_every: int,
+) -> None:
+    while True:
+        worker.apply_profile_control()
+        readable, _, _ = io_select.select([connection], [], [], 0)
+        if readable:
+            if _recv_exact(connection, 1) != CONTROL_MESSAGE:
+                raise RuntimeError("MemFabric hot path accepts only TCP control messages")
+            _handle_control(worker, connection, recv_framed(connection))
+            continue
+        request = mailbox.try_receive(worker.host_buffer)
+        if request is None:
+            continue
+        request_id = int(request["request_id"])
+        started_at = time.perf_counter()
+        try:
+            topk = worker.select(request)
+            mailbox.respond(request_id, topk)
+        except Exception:
+            mailbox.respond_error(request_id)
+            raise
+        if request_id % log_every == 0:
+            print(
+                json.dumps(
+                    {
+                        "event": "select",
+                        "transport": "memfabric_mailbox",
+                        "rank": worker.rank,
+                        "request_id": request_id,
+                        "layer_id": request["layer_id"],
+                        "tokens": request["q"].shape[0],
+                        "elapsed_ms": (time.perf_counter() - started_at) * 1000,
+                    }
+                ),
+                flush=True,
+            )
 
 
 def serve(args: argparse.Namespace) -> None:
@@ -292,10 +375,18 @@ def serve(args: argparse.Namespace) -> None:
         message_kind = None
         try:
             hello = recv_framed(connection)
-            if hello != {
+            transport = hello.get("select_transport", "raw_tcp")
+            expected_hello = {
                 "op": "hello",
                 "version": PROTOCOL_VERSION,
                 "rank": args.rank,
+                "select_transport": transport,
+            }
+            if transport == "memfabric_mailbox":
+                expected_hello["memfabric_store_url"] = hello.get("memfabric_store_url")
+            if hello != expected_hello or transport not in {
+                "raw_tcp",
+                "memfabric_mailbox",
             }:
                 raise RuntimeError(f"Invalid handshake: {hello!r}")
             send_framed(
@@ -303,7 +394,7 @@ def serve(args: argparse.Namespace) -> None:
                 {
                     "ok": True,
                     "version": PROTOCOL_VERSION,
-                    "select_transport": "raw",
+                    "select_transport": ("memfabric_mailbox" if transport == "memfabric_mailbox" else "raw"),
                 },
             )
             print(
@@ -312,10 +403,63 @@ def serve(args: argparse.Namespace) -> None:
                         "event": "connected",
                         "rank": args.rank,
                         "peer": peer[0],
+                        "transport": transport,
                     }
                 ),
                 flush=True,
             )
+            if transport == "memfabric_mailbox":
+                from .memfabric_mailbox import MemfabricMailboxServer
+
+                store_url = hello.get("memfabric_store_url")
+                if not isinstance(store_url, str) or not store_url:
+                    raise ValueError("MemFabric mailbox handshake has no store URL")
+                initialized = recv_framed(connection)
+                expected_initialized = {
+                    "op": "memfabric_rank0_initialized",
+                    "version": PROTOCOL_VERSION,
+                    "rank": args.rank,
+                }
+                if initialized != expected_initialized:
+                    raise RuntimeError(f"Invalid MemFabric rank-0 initialization: {initialized!r}")
+                # Rank 1 must be listening before rank 0 joins, otherwise it
+                # misses the dynamic-group event and later starts from size 0.
+                # It must not join yet because simultaneous first joins are
+                # also broken in MemFabric 1.2.
+                mailbox = MemfabricMailboxServer(
+                    logical_rank=args.rank,
+                    store_url=store_url,
+                    device=args.device,
+                    timeout_s=args.connect_timeout,
+                    defer_join=True,
+                )
+                send_framed(connection, {"ok": True, "memfabric_rank0_join": True})
+                joined = recv_framed(connection)
+                expected_joined = {
+                    "op": "memfabric_rank0_joined",
+                    "version": PROTOCOL_VERSION,
+                    "rank": args.rank,
+                }
+                if joined != expected_joined:
+                    raise RuntimeError(f"Invalid MemFabric join completion: {joined!r}")
+                # Rank 0 returns after its callback, while rank 1 consumes the
+                # event on another thread.  This bounded startup-only delay
+                # lets rank 1 publish the observed group size before joining.
+                time.sleep(1.0)
+                mailbox.join()
+                print(
+                    json.dumps(
+                        {
+                            "event": "mailbox_ready",
+                            "rank": args.rank,
+                            "rendezvous": ("rank0_store_rank1_listen_rank0_join_rank1_join"),
+                        }
+                    ),
+                    flush=True,
+                )
+                send_framed(connection, {"ok": True, "mailbox_ready": True})
+                _serve_memfabric(worker, connection, mailbox, args.log_every)
+                continue
             while True:
                 message_kind = _recv_exact(connection, 1)
                 worker.apply_profile_control()
@@ -325,9 +469,7 @@ def serve(args: argparse.Namespace) -> None:
                     # when header decoding itself fails.
                     request_id = 0
                     try:
-                        request = recv_raw_select_request(
-                            connection, worker.host_buffer
-                        )
+                        request = recv_raw_select_request(connection, worker.host_buffer)
                         request_id = int(request["request_id"])
                         topk = worker.select(request)
                         send_raw_select_response(connection, request_id, topk)
@@ -343,65 +485,15 @@ def serve(args: argparse.Namespace) -> None:
                                     "request_id": request_id,
                                     "layer_id": request["layer_id"],
                                     "tokens": request["q"].shape[0],
-                                    "elapsed_ms": (
-                                        time.perf_counter() - started_at
-                                    )
-                                    * 1000,
+                                    "elapsed_ms": (time.perf_counter() - started_at) * 1000,
                                 }
                             ),
                             flush=True,
                         )
                     continue
                 if message_kind != CONTROL_MESSAGE:
-                    raise RuntimeError(
-                        f"Unsupported message kind: {message_kind!r}"
-                    )
-                request = recv_framed(connection)
-                if request.get("op") == "reset_cache":
-                    if request.get("rank") != args.rank:
-                        raise RuntimeError(
-                            "Request rank mismatch: "
-                            f"expected={args.rank}, got={request.get('rank')}"
-                        )
-                    worker.reset_cache()
-                    send_framed(connection, {"ok": True, "op": "reset_cache"})
-                    print(
-                        json.dumps(
-                            {
-                                "event": "cache_reset",
-                                "rank": args.rank,
-                                "layers": len(worker.caches),
-                            }
-                        ),
-                        flush=True,
-                    )
-                    continue
-                if request.get("op") == "fill_blocks":
-                    if request.get("rank") != args.rank:
-                        raise RuntimeError(
-                            "Request rank mismatch: "
-                            f"expected={args.rank}, got={request.get('rank')}"
-                        )
-                    block_ids = request.get("block_ids")
-                    if not isinstance(block_ids, list):
-                        raise TypeError("fill_blocks requires a block_ids list")
-                    worker.fill_blocks(block_ids)
-                    send_framed(connection, {"ok": True, "op": "fill_blocks"})
-                    print(
-                        json.dumps(
-                            {
-                                "event": "blocks_filled",
-                                "rank": args.rank,
-                                "blocks": len(set(block_ids)),
-                                "layers": len(worker.caches),
-                            }
-                        ),
-                        flush=True,
-                    )
-                    continue
-                raise RuntimeError(
-                    f"Unsupported control request: {request.get('op')!r}"
-                )
+                    raise RuntimeError(f"Unsupported message kind: {message_kind!r}")
+                _handle_control(worker, connection, recv_framed(connection))
         except (ConnectionError, EOFError):
             pass
         except Exception as error:
@@ -417,10 +509,8 @@ def serve(args: argparse.Namespace) -> None:
                 flush=True,
             )
             if message_kind != SELECT_MESSAGE:
-                try:
+                with contextlib.suppress(Exception):
                     send_framed(connection, {"ok": False, "error": repr(error)})
-                except Exception:
-                    pass
         finally:
             connection.close()
 
@@ -440,6 +530,7 @@ def main() -> None:
     parser.add_argument("--profile-dir")
     parser.add_argument("--pid-file")
     parser.add_argument("--log-every", type=int, default=61)
+    parser.add_argument("--connect-timeout", type=float, default=120.0)
     serve(parser.parse_args())
 
 

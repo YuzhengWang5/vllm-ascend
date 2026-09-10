@@ -1038,20 +1038,15 @@ class SparseKVOffloadConfig:
         self.topk_buffer_size = int(user_config.get("topk_buffer_size", 4096))
         self.dram_size_per_dp_GB = int(user_config.get("dram_size_per_dp_GB", 128))
         self.keep_device_kv_cache = bool(user_config.get("keep_device_kv_cache", False))
-        self.motivation_baseline = str(
-            user_config.get("motivation_baseline", "colocated")
-        )
-        self.motivation_force_oracle_trace = bool(
-            user_config.get("motivation_force_oracle_trace", False)
-        )
-        self.remote_indexer_host = str(
-            user_config.get("remote_indexer_host", "")
-        )
-        self.remote_indexer_base_port = int(
-            user_config.get("remote_indexer_base_port", 26000)
-        )
-        self.remote_indexer_connect_timeout_s = float(
-            user_config.get("remote_indexer_connect_timeout_s", 30.0)
+        self.motivation_baseline = str(user_config.get("motivation_baseline", "colocated"))
+        self.motivation_force_oracle_trace = bool(user_config.get("motivation_force_oracle_trace", False))
+        self.remote_indexer_host = str(user_config.get("remote_indexer_host", ""))
+        self.remote_indexer_base_port = int(user_config.get("remote_indexer_base_port", 26000))
+        self.remote_indexer_connect_timeout_s = float(user_config.get("remote_indexer_connect_timeout_s", 30.0))
+        self.remote_indexer_transport = str(user_config.get("remote_indexer_transport", "raw_tcp"))
+        self.remote_indexer_memfabric_store_host = str(user_config.get("remote_indexer_memfabric_store_host", ""))
+        self.remote_indexer_memfabric_store_base_port = int(
+            user_config.get("remote_indexer_memfabric_store_base_port", 28572)
         )
         self.remote_indexer_enabled = bool(self.remote_indexer_host)
         supported_motivation_baselines = {
@@ -1073,10 +1068,21 @@ class SparseKVOffloadConfig:
                 f"{self.remote_indexer_base_port}"
             )
         if self.remote_indexer_connect_timeout_s <= 0:
+            raise ValueError("sparse_kv_offload_config.remote_indexer_connect_timeout_s must be positive")
+        if self.remote_indexer_transport not in {"raw_tcp", "memfabric_mailbox"}:
             raise ValueError(
-                "sparse_kv_offload_config.remote_indexer_connect_timeout_s "
-                "must be positive"
+                "sparse_kv_offload_config.remote_indexer_transport must be "
+                "'raw_tcp' or 'memfabric_mailbox', got "
+                f"{self.remote_indexer_transport!r}"
             )
+        if not 1 <= self.remote_indexer_memfabric_store_base_port <= 65520:
+            raise ValueError("remote_indexer_memfabric_store_base_port must leave room for rank-local ports")
+        if (
+            self.remote_indexer_enabled
+            and self.remote_indexer_transport == "memfabric_mailbox"
+            and not self.remote_indexer_memfabric_store_host
+        ):
+            raise ValueError("MemFabric mailbox requires remote_indexer_memfabric_store_host")
         if self.remote_indexer_enabled and self.motivation_baseline != "colocated":
             raise ValueError(
                 "Remote indexer must use motivation_baseline='colocated'; "

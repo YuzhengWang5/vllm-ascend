@@ -18,8 +18,7 @@ import torch
 import torch_npu
 from vllm.logger import logger
 
-
-PROTOCOL_VERSION = 2
+PROTOCOL_VERSION = 9
 MAX_MESSAGE_BYTES = 1 << 30
 _LENGTH = struct.Struct("!Q")
 CONTROL_MESSAGE = b"C"
@@ -28,7 +27,7 @@ _SELECT_HEADER = struct.Struct("!Qi10I")
 _SELECT_RESPONSE_HEADER = struct.Struct("!BQ")
 _SELECT_OK = 1
 _SELECT_ERROR = 0
-_GRAPH_CLIENTS: dict[int, "RemoteIndexerClient"] = {}
+_GRAPH_CLIENTS: dict[int, RemoteIndexerClient] = {}
 
 
 def _run_graph_callback(rank: int, layer_id: int) -> None:
@@ -241,13 +240,9 @@ def recv_raw_select_response(
     request_id: int,
     output: torch.Tensor,
 ) -> None:
-    status, response_id = _SELECT_RESPONSE_HEADER.unpack(
-        _recv_exact(sock, _SELECT_RESPONSE_HEADER.size)
-    )
+    status, response_id = _SELECT_RESPONSE_HEADER.unpack(_recv_exact(sock, _SELECT_RESPONSE_HEADER.size))
     if response_id != request_id:
-        raise RuntimeError(
-            f"Remote indexer response id mismatch: expected={request_id}, got={response_id}"
-        )
+        raise RuntimeError(f"Remote indexer response id mismatch: expected={request_id}, got={response_id}")
     if status != _SELECT_OK:
         response = recv_framed(sock)
         raise RuntimeError(f"Remote indexer request failed: {response!r}")
@@ -264,13 +259,18 @@ class RemoteIndexerClient:
         rank: int,
         topk: int,
         connect_timeout_s: float,
+        transport: str = "raw_tcp",
+        memfabric_store_url: str = "",
     ) -> None:
         self.host = host
         self.port = port
         self.rank = rank
         self.topk = topk
         self.connect_timeout_s = connect_timeout_s
+        self.transport = transport
+        self.memfabric_store_url = memfabric_store_url
         self._socket: socket.socket | None = None
+        self._mailbox = None
         self._buffers: dict[tuple[str, tuple[int, ...], torch.dtype], torch.Tensor] = {}
         self._lock = threading.Lock()
         self._request_id = 0
@@ -297,10 +297,7 @@ class RemoteIndexerClient:
             )
             response = recv_framed(sock)
             if response != {"ok": True, "op": "reset_cache"}:
-                raise RuntimeError(
-                    "Remote indexer cache reset failed: "
-                    f"rank={self.rank}, response={response!r}"
-                )
+                raise RuntimeError(f"Remote indexer cache reset failed: rank={self.rank}, response={response!r}")
 
     def fill_blocks(self, block_ids: list[int]) -> None:
         """Initialize newly allocated/reused cache blocks like the connector."""
@@ -320,10 +317,7 @@ class RemoteIndexerClient:
             )
             response = recv_framed(sock)
             if response != {"ok": True, "op": "fill_blocks"}:
-                raise RuntimeError(
-                    "Remote indexer block fill failed: "
-                    f"rank={self.rank}, response={response!r}"
-                )
+                raise RuntimeError(f"Remote indexer block fill failed: rank={self.rank}, response={response!r}")
 
     def _connect(self) -> socket.socket:
         if self._socket is not None:
@@ -334,22 +328,59 @@ class RemoteIndexerClient:
         )
         sock.settimeout(None)
         sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-        send_framed(
-            sock,
-            {
-                "op": "hello",
-                "version": PROTOCOL_VERSION,
-                "rank": self.rank,
-            },
-        )
+        hello = {
+            "op": "hello",
+            "version": PROTOCOL_VERSION,
+            "rank": self.rank,
+            "select_transport": self.transport,
+        }
+        if self.transport == "memfabric_mailbox":
+            hello["memfabric_store_url"] = self.memfabric_store_url
+        send_framed(sock, hello)
         response = recv_framed(sock)
+        expected_transport = "memfabric_mailbox" if self.transport == "memfabric_mailbox" else "raw"
         if response != {
             "ok": True,
             "version": PROTOCOL_VERSION,
-            "select_transport": "raw",
+            "select_transport": expected_transport,
         }:
             sock.close()
             raise RuntimeError(f"Remote indexer handshake failed: {response!r}")
+        if self.transport == "memfabric_mailbox":
+            if not self.memfabric_store_url:
+                raise ValueError("MemFabric mailbox requires a config-store URL")
+            from .memfabric_mailbox import MemfabricMailboxClient
+
+            self._mailbox = MemfabricMailboxClient(
+                logical_rank=self.rank,
+                store_url=self.memfabric_store_url,
+                device=torch_npu.npu.current_device(),
+                timeout_s=self.connect_timeout_s,
+                defer_create=True,
+            )
+            send_framed(
+                sock,
+                {
+                    "op": "memfabric_rank0_initialized",
+                    "version": PROTOCOL_VERSION,
+                    "rank": self.rank,
+                },
+            )
+            rank0_join = recv_framed(sock)
+            if rank0_join != {"ok": True, "memfabric_rank0_join": True}:
+                raise RuntimeError(f"Remote indexer mailbox pre-initialization failed: {rank0_join!r}")
+            self._mailbox.create()
+            send_framed(
+                sock,
+                {
+                    "op": "memfabric_rank0_joined",
+                    "version": PROTOCOL_VERSION,
+                    "rank": self.rank,
+                },
+            )
+            ready = recv_framed(sock)
+            if ready != {"ok": True, "mailbox_ready": True}:
+                raise RuntimeError(f"Remote indexer mailbox bootstrap failed: {ready!r}")
         self._socket = sock
         logger.warning(
             "Remote indexer rank %d connected to %s:%d",
@@ -450,5 +481,13 @@ class RemoteIndexerClient:
             sock = self._connect()
             request_id = self._request_id
             self._request_id += 1
-            send_raw_select_request(sock, request_id, layer_id, staged)
-            recv_raw_select_response(sock, request_id, output_cpu)
+            if self._mailbox is None:
+                send_raw_select_request(sock, request_id, layer_id, staged)
+                recv_raw_select_response(sock, request_id, output_cpu)
+            else:
+                self._mailbox.select(
+                    request_id + 1,
+                    layer_id,
+                    staged,
+                    output_cpu,
+                )

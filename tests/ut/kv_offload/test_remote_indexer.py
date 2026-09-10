@@ -7,8 +7,9 @@ import torch
 from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.remote_indexer import (
     CONTROL_MESSAGE,
     MAX_MESSAGE_BYTES,
-    RemoteIndexerClient,
+    PROTOCOL_VERSION,
     SELECT_MESSAGE,
+    RemoteIndexerClient,
     _recv_exact,
     _run_graph_callback,
     recv_framed,
@@ -144,7 +145,7 @@ def test_reset_cache_uses_rank_local_connection():
     server_sock.close()
 
     assert received == [
-        {"op": "reset_cache", "version": 2, "rank": 5},
+        {"op": "reset_cache", "version": PROTOCOL_VERSION, "rank": 5},
     ]
 
 
@@ -175,7 +176,7 @@ def test_fill_blocks_uses_rank_local_connection_and_deduplicates():
     assert received == [
         {
             "op": "fill_blocks",
-            "version": 2,
+            "version": PROTOCOL_VERSION,
             "rank": 6,
             "block_ids": [3, 7],
         },
