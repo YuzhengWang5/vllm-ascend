@@ -1,11 +1,8 @@
-"""Trivial synchronous TCP client for a remote SFA indexer.
+"""Synchronous TCP client for a remote SFA indexer.
 
-The v0 transport intentionally favors a small, inspectable implementation over
-performance.  Each decoder rank owns one persistent connection to one remote
-NPU worker.  Device tensors are staged through pinned host memory, serialized
-with ``torch.save``, and the returned top-k ids are copied back to the decoder
-NPU.  Later experiments can replace this transport without changing the SFA
-selection boundary.
+Each decoder rank owns one persistent connection to one remote NPU worker.
+Control messages use the original inspectable torch framing, while the hot
+select path uses a fixed-schema header followed by contiguous tensor bytes.
 """
 
 from __future__ import annotations
@@ -14,6 +11,7 @@ import io
 import socket
 import struct
 import threading
+from collections.abc import Callable
 from typing import Any
 
 import torch
@@ -21,9 +19,15 @@ import torch_npu
 from vllm.logger import logger
 
 
-PROTOCOL_VERSION = 1
+PROTOCOL_VERSION = 2
 MAX_MESSAGE_BYTES = 1 << 30
 _LENGTH = struct.Struct("!Q")
+CONTROL_MESSAGE = b"C"
+SELECT_MESSAGE = b"S"
+_SELECT_HEADER = struct.Struct("!Qi10I")
+_SELECT_RESPONSE_HEADER = struct.Struct("!BQ")
+_SELECT_OK = 1
+_SELECT_ERROR = 0
 _GRAPH_CLIENTS: dict[int, "RemoteIndexerClient"] = {}
 
 
@@ -69,6 +73,187 @@ def recv_framed(sock: socket.socket) -> Any:
     return torch.load(io.BytesIO(_recv_exact(sock, size)), map_location="cpu", weights_only=True)
 
 
+def _tensor_bytes(tensor: torch.Tensor) -> memoryview:
+    if tensor.device.type != "cpu" or not tensor.is_contiguous():
+        raise ValueError("Raw transport requires contiguous CPU tensors")
+    return memoryview(tensor.numpy()).cast("B")
+
+
+def _send_views(sock: socket.socket, values: list[bytes | memoryview]) -> None:
+    views = [memoryview(value).cast("B") for value in values if len(value)]
+    if not hasattr(sock, "sendmsg"):
+        for value in views:
+            sock.sendall(value)
+        return
+    while views:
+        sent = sock.sendmsg(views)
+        if sent == 0:
+            raise ConnectionError("Remote indexer connection closed while sending")
+        while views and sent >= len(views[0]):
+            sent -= len(views.pop(0))
+        if sent:
+            views[0] = views[0][sent:]
+
+
+def _recv_into_tensor(sock: socket.socket, tensor: torch.Tensor) -> None:
+    view = _tensor_bytes(tensor)
+    offset = 0
+    while offset < len(view):
+        received = sock.recv_into(view[offset:])
+        if received == 0:
+            raise ConnectionError("Remote indexer connection closed while receiving tensor")
+        offset += received
+
+
+def send_raw_select_request(
+    sock: socket.socket,
+    request_id: int,
+    layer_id: int,
+    tensors: dict[str, torch.Tensor],
+) -> None:
+    q = tensors["q"]
+    q_scale = tensors["q_scale"]
+    weights = tensors["weights"]
+    new_k = tensors["new_k"]
+    new_k_scale = tensors["new_k_scale"]
+    slot_mapping = tensors["slot_mapping"]
+    query_lens = tensors["actual_seq_lengths_query"]
+    key_lens = tensors["actual_seq_lengths_key"]
+    block_table = tensors["block_table"]
+    if q.ndim != 3 or q.dtype != torch.int8:
+        raise ValueError(f"Raw select expects int8 q[T,H,D], got {q.shape}/{q.dtype}")
+    tokens, heads, dim = q.shape
+    if q_scale.shape != (tokens, heads) or q_scale.dtype != torch.float16:
+        raise ValueError("Raw select expects FP16 q_scale[T,H]")
+    if weights.shape != (tokens, heads) or weights.dtype != torch.float16:
+        raise ValueError("Raw select expects FP16 weights[T,H]")
+    if new_k.ndim != 2 or new_k.shape[1] != dim or new_k.dtype != torch.int8:
+        raise ValueError("Raw select expects int8 new_k[N,D]")
+    if new_k_scale.shape != (new_k.shape[0], 1) or new_k_scale.dtype != torch.float16:
+        raise ValueError("Raw select expects FP16 new_k_scale[N,1]")
+    if slot_mapping.dtype not in {torch.int32, torch.int64}:
+        raise ValueError("Raw select expects int32/int64 slot_mapping")
+    if query_lens.dtype != torch.int32 or key_lens.dtype != torch.int32:
+        raise ValueError("Raw select expects int32 sequence lengths")
+    if block_table.ndim != 2 or block_table.dtype != torch.int32:
+        raise ValueError("Raw select expects int32 block_table[B,M]")
+    header = _SELECT_HEADER.pack(
+        request_id,
+        layer_id,
+        tokens,
+        heads,
+        dim,
+        new_k.shape[0],
+        slot_mapping.numel(),
+        query_lens.numel(),
+        key_lens.numel(),
+        block_table.shape[0],
+        block_table.shape[1],
+        slot_mapping.element_size(),
+    )
+    _send_views(
+        sock,
+        [
+            SELECT_MESSAGE,
+            header,
+            *(
+                _tensor_bytes(tensors[name])
+                for name in (
+                    "q",
+                    "q_scale",
+                    "weights",
+                    "new_k",
+                    "new_k_scale",
+                    "slot_mapping",
+                    "actual_seq_lengths_query",
+                    "actual_seq_lengths_key",
+                    "block_table",
+                )
+            ),
+        ],
+    )
+
+
+def recv_raw_select_request(
+    sock: socket.socket,
+    buffer_getter: Callable[[str, tuple[int, ...], torch.dtype], torch.Tensor],
+) -> dict[str, Any]:
+    values = _SELECT_HEADER.unpack(_recv_exact(sock, _SELECT_HEADER.size))
+    request_id, layer_id = values[:2]
+    (
+        tokens,
+        heads,
+        dim,
+        new_rows,
+        slot_count,
+        query_len_count,
+        key_len_count,
+        block_rows,
+        block_cols,
+        slot_width,
+    ) = values[2:]
+    slot_dtype = {4: torch.int32, 8: torch.int64}.get(slot_width)
+    if slot_dtype is None:
+        raise ValueError(f"Unsupported slot_mapping element size: {slot_width}")
+    specs = (
+        ("q", (tokens, heads, dim), torch.int8),
+        ("q_scale", (tokens, heads), torch.float16),
+        ("weights", (tokens, heads), torch.float16),
+        ("new_k", (new_rows, dim), torch.int8),
+        ("new_k_scale", (new_rows, 1), torch.float16),
+        ("slot_mapping", (slot_count,), slot_dtype),
+        ("actual_seq_lengths_query", (query_len_count,), torch.int32),
+        ("actual_seq_lengths_key", (key_len_count,), torch.int32),
+        ("block_table", (block_rows, block_cols), torch.int32),
+    )
+    tensors = {}
+    total_bytes = 0
+    for name, shape, dtype in specs:
+        tensor = buffer_getter(name, shape, dtype)
+        total_bytes += tensor.numel() * tensor.element_size()
+        if total_bytes > MAX_MESSAGE_BYTES:
+            raise ValueError("Raw select payload is too large")
+        _recv_into_tensor(sock, tensor)
+        tensors[name] = tensor
+    return {"request_id": request_id, "layer_id": layer_id, **tensors}
+
+
+def send_raw_select_response(
+    sock: socket.socket,
+    request_id: int,
+    topk: torch.Tensor,
+) -> None:
+    if topk.dtype != torch.int32 or topk.device.type != "cpu":
+        raise ValueError("Raw select response requires a CPU int32 tensor")
+    _send_views(
+        sock,
+        [_SELECT_RESPONSE_HEADER.pack(_SELECT_OK, request_id), _tensor_bytes(topk)],
+    )
+
+
+def send_raw_select_error(sock: socket.socket, request_id: int, error: str) -> None:
+    sock.sendall(_SELECT_RESPONSE_HEADER.pack(_SELECT_ERROR, request_id))
+    send_framed(sock, {"error": error})
+
+
+def recv_raw_select_response(
+    sock: socket.socket,
+    request_id: int,
+    output: torch.Tensor,
+) -> None:
+    status, response_id = _SELECT_RESPONSE_HEADER.unpack(
+        _recv_exact(sock, _SELECT_RESPONSE_HEADER.size)
+    )
+    if response_id != request_id:
+        raise RuntimeError(
+            f"Remote indexer response id mismatch: expected={request_id}, got={response_id}"
+        )
+    if status != _SELECT_OK:
+        response = recv_framed(sock)
+        raise RuntimeError(f"Remote indexer request failed: {response!r}")
+    _recv_into_tensor(sock, output)
+
+
 class RemoteIndexerClient:
     """One rank-local synchronous remote-indexer connection."""
 
@@ -101,6 +286,7 @@ class RemoteIndexerClient:
         """Restore the remote cache after graph capture's dummy execution."""
         with self._lock:
             sock = self._connect()
+            sock.sendall(CONTROL_MESSAGE)
             send_framed(
                 sock,
                 {
@@ -122,6 +308,7 @@ class RemoteIndexerClient:
             return
         with self._lock:
             sock = self._connect()
+            sock.sendall(CONTROL_MESSAGE)
             send_framed(
                 sock,
                 {
@@ -156,7 +343,11 @@ class RemoteIndexerClient:
             },
         )
         response = recv_framed(sock)
-        if response != {"ok": True, "version": PROTOCOL_VERSION}:
+        if response != {
+            "ok": True,
+            "version": PROTOCOL_VERSION,
+            "select_transport": "raw",
+        }:
             sock.close()
             raise RuntimeError(f"Remote indexer handshake failed: {response!r}")
         self._socket = sock
@@ -259,31 +450,5 @@ class RemoteIndexerClient:
             sock = self._connect()
             request_id = self._request_id
             self._request_id += 1
-            request = {
-                "op": "select",
-                "version": PROTOCOL_VERSION,
-                "rank": self.rank,
-                "request_id": request_id,
-                "layer_id": layer_id,
-                **staged,
-            }
-            send_framed(sock, request)
-            response = recv_framed(sock)
-            if not response.get("ok"):
-                raise RuntimeError(
-                    "Remote indexer request failed: "
-                    f"rank={self.rank}, layer={layer_id}, response={response!r}"
-                )
-            if response.get("request_id") != request_id:
-                raise RuntimeError(
-                    "Remote indexer response id mismatch: "
-                    f"expected={request_id}, got={response.get('request_id')}"
-                )
-            topk = response["topk"]
-            if topk.shape != output_cpu.shape or topk.dtype != output_cpu.dtype:
-                raise RuntimeError(
-                    "Remote indexer output mismatch: "
-                    f"expected={output_cpu.shape}/{output_cpu.dtype}, "
-                    f"got={topk.shape}/{topk.dtype}"
-                )
-            output_cpu.copy_(topk)
+            send_raw_select_request(sock, request_id, layer_id, staged)
+            recv_raw_select_response(sock, request_id, output_cpu)

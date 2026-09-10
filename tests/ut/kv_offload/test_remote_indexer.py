@@ -5,11 +5,18 @@ import pytest
 import torch
 
 from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.remote_indexer import (
+    CONTROL_MESSAGE,
     MAX_MESSAGE_BYTES,
     RemoteIndexerClient,
+    SELECT_MESSAGE,
+    _recv_exact,
     _run_graph_callback,
     recv_framed,
+    recv_raw_select_request,
+    recv_raw_select_response,
     send_framed,
+    send_raw_select_request,
+    send_raw_select_response,
 )
 
 
@@ -30,6 +37,50 @@ def test_framed_torch_payload_round_trip():
     assert result["op"] == "select"
     assert result["rank"] == 3
     torch.testing.assert_close(result["query"], payload["query"])
+
+
+def test_raw_select_request_and_response_round_trip():
+    sender, receiver = socket.socketpair()
+    tensors = {
+        "q": torch.arange(24, dtype=torch.int8).view(2, 3, 4),
+        "q_scale": torch.arange(6, dtype=torch.float16).view(2, 3),
+        "weights": torch.arange(6, dtype=torch.float16).view(2, 3) + 1,
+        "new_k": torch.arange(8, dtype=torch.int8).view(2, 4),
+        "new_k_scale": torch.ones((2, 1), dtype=torch.float16),
+        "slot_mapping": torch.tensor([7, 9], dtype=torch.int64),
+        "actual_seq_lengths_query": torch.tensor([1, 2], dtype=torch.int32),
+        "actual_seq_lengths_key": torch.tensor([129, 130], dtype=torch.int32),
+        "block_table": torch.tensor([[0, 1], [2, 3]], dtype=torch.int32),
+    }
+    thread = threading.Thread(
+        target=send_raw_select_request,
+        args=(sender, 17, 4, tensors),
+    )
+    thread.start()
+    assert _recv_exact(receiver, 1) == SELECT_MESSAGE
+    request = recv_raw_select_request(
+        receiver,
+        lambda _name, shape, dtype: torch.empty(shape, dtype=dtype),
+    )
+    thread.join()
+
+    assert request["request_id"] == 17
+    assert request["layer_id"] == 4
+    for name, expected in tensors.items():
+        torch.testing.assert_close(request[name], expected)
+
+    topk = torch.arange(10, dtype=torch.int32).view(2, 1, 5)
+    output = torch.empty_like(topk)
+    thread = threading.Thread(
+        target=send_raw_select_response,
+        args=(receiver, 17, topk),
+    )
+    thread.start()
+    recv_raw_select_response(sender, 17, output)
+    thread.join()
+    torch.testing.assert_close(output, topk)
+    sender.close()
+    receiver.close()
 
 
 def test_graph_callback_dispatches_to_rank_local_client(monkeypatch):
@@ -81,6 +132,7 @@ def test_reset_cache_uses_rank_local_connection():
     received = []
 
     def serve_reset() -> None:
+        assert _recv_exact(server_sock, 1) == CONTROL_MESSAGE
         received.append(recv_framed(server_sock))
         send_framed(server_sock, {"ok": True, "op": "reset_cache"})
 
@@ -92,7 +144,7 @@ def test_reset_cache_uses_rank_local_connection():
     server_sock.close()
 
     assert received == [
-        {"op": "reset_cache", "version": 1, "rank": 5},
+        {"op": "reset_cache", "version": 2, "rank": 5},
     ]
 
 
@@ -109,6 +161,7 @@ def test_fill_blocks_uses_rank_local_connection_and_deduplicates():
     received = []
 
     def serve_fill() -> None:
+        assert _recv_exact(server_sock, 1) == CONTROL_MESSAGE
         received.append(recv_framed(server_sock))
         send_framed(server_sock, {"ok": True, "op": "fill_blocks"})
 
@@ -122,7 +175,7 @@ def test_fill_blocks_uses_rank_local_connection_and_deduplicates():
     assert received == [
         {
             "op": "fill_blocks",
-            "version": 1,
+            "version": 2,
             "rank": 6,
             "block_ids": [3, 7],
         },

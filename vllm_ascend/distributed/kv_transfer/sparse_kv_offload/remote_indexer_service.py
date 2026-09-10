@@ -14,7 +14,17 @@ import traceback
 import torch
 import torch_npu
 
-from .remote_indexer import PROTOCOL_VERSION, recv_framed, send_framed
+from .remote_indexer import (
+    CONTROL_MESSAGE,
+    PROTOCOL_VERSION,
+    SELECT_MESSAGE,
+    _recv_exact,
+    recv_framed,
+    recv_raw_select_request,
+    send_framed,
+    send_raw_select_error,
+    send_raw_select_response,
+)
 
 
 class RemoteIndexerWorker:
@@ -41,6 +51,9 @@ class RemoteIndexerWorker:
         self.indexer_scale_value = indexer_scale_value
         self.profile_dir = profile_dir
         self.caches: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+        self.host_buffers: dict[
+            tuple[str, tuple[int, ...], torch.dtype], torch.Tensor
+        ] = {}
         self._profiler = None
         self._profile_active = False
         self._profile_start_requested = False
@@ -134,6 +147,19 @@ class RemoteIndexerWorker:
             cache = (key, scale)
             self.caches[layer_id] = cache
         return cache
+
+    def host_buffer(
+        self,
+        name: str,
+        shape: tuple[int, ...],
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        key = (name, shape, dtype)
+        buffer = self.host_buffers.get(key)
+        if buffer is None:
+            buffer = torch.empty(shape, dtype=dtype, device="cpu", pin_memory=True)
+            self.host_buffers[key] = buffer
+        return buffer
 
     def reset_cache(self) -> None:
         """Undo cache writes performed by the graph's capture execution."""
@@ -263,6 +289,7 @@ def serve(args: argparse.Namespace) -> None:
     while True:
         connection, peer = listen.accept()
         connection.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        message_kind = None
         try:
             hello = recv_framed(connection)
             if hello != {
@@ -271,7 +298,14 @@ def serve(args: argparse.Namespace) -> None:
                 "rank": args.rank,
             }:
                 raise RuntimeError(f"Invalid handshake: {hello!r}")
-            send_framed(connection, {"ok": True, "version": PROTOCOL_VERSION})
+            send_framed(
+                connection,
+                {
+                    "ok": True,
+                    "version": PROTOCOL_VERSION,
+                    "select_transport": "raw",
+                },
+            )
             print(
                 json.dumps(
                     {
@@ -283,9 +317,46 @@ def serve(args: argparse.Namespace) -> None:
                 flush=True,
             )
             while True:
-                request = recv_framed(connection)
+                message_kind = _recv_exact(connection, 1)
                 worker.apply_profile_control()
                 started_at = time.perf_counter()
+                if message_kind == SELECT_MESSAGE:
+                    # Keep the fallback valid for the unsigned wire field even
+                    # when header decoding itself fails.
+                    request_id = 0
+                    try:
+                        request = recv_raw_select_request(
+                            connection, worker.host_buffer
+                        )
+                        request_id = int(request["request_id"])
+                        topk = worker.select(request)
+                        send_raw_select_response(connection, request_id, topk)
+                    except Exception as error:
+                        send_raw_select_error(connection, request_id, repr(error))
+                        raise
+                    if request_id % args.log_every == 0:
+                        print(
+                            json.dumps(
+                                {
+                                    "event": "select",
+                                    "rank": args.rank,
+                                    "request_id": request_id,
+                                    "layer_id": request["layer_id"],
+                                    "tokens": request["q"].shape[0],
+                                    "elapsed_ms": (
+                                        time.perf_counter() - started_at
+                                    )
+                                    * 1000,
+                                }
+                            ),
+                            flush=True,
+                        )
+                    continue
+                if message_kind != CONTROL_MESSAGE:
+                    raise RuntimeError(
+                        f"Unsupported message kind: {message_kind!r}"
+                    )
+                request = recv_framed(connection)
                 if request.get("op") == "reset_cache":
                     if request.get("rank") != args.rank:
                         raise RuntimeError(
@@ -328,35 +399,9 @@ def serve(args: argparse.Namespace) -> None:
                         flush=True,
                     )
                     continue
-                if request.get("op") != "select":
-                    raise RuntimeError(f"Unsupported request: {request.get('op')!r}")
-                if request.get("rank") != args.rank:
-                    raise RuntimeError(
-                        f"Request rank mismatch: expected={args.rank}, got={request.get('rank')}"
-                    )
-                topk = worker.select(request)
-                send_framed(
-                    connection,
-                    {
-                        "ok": True,
-                        "request_id": request["request_id"],
-                        "topk": topk,
-                    },
+                raise RuntimeError(
+                    f"Unsupported control request: {request.get('op')!r}"
                 )
-                if request["request_id"] % args.log_every == 0:
-                    print(
-                        json.dumps(
-                            {
-                                "event": "select",
-                                "rank": args.rank,
-                                "request_id": request["request_id"],
-                                "layer_id": request["layer_id"],
-                                "tokens": request["q"].shape[0],
-                                "elapsed_ms": (time.perf_counter() - started_at) * 1000,
-                            }
-                        ),
-                        flush=True,
-                    )
         except (ConnectionError, EOFError):
             pass
         except Exception as error:
@@ -371,10 +416,11 @@ def serve(args: argparse.Namespace) -> None:
                 ),
                 flush=True,
             )
-            try:
-                send_framed(connection, {"ok": False, "error": repr(error)})
-            except Exception:
-                pass
+            if message_kind != SELECT_MESSAGE:
+                try:
+                    send_framed(connection, {"ok": False, "error": repr(error)})
+                except Exception:
+                    pass
         finally:
             connection.close()
 
