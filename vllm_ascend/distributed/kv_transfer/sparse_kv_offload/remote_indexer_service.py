@@ -17,6 +17,7 @@ import torch_npu
 from .remote_indexer import (
     CONTROL_MESSAGE,
     PROTOCOL_VERSION,
+    SELECT_CONTEXT_TENSORS,
     SELECT_MESSAGE,
     _recv_exact,
     recv_framed,
@@ -25,6 +26,21 @@ from .remote_indexer import (
     send_raw_select_error,
     send_raw_select_response,
 )
+
+
+def _resolve_select_context(
+    request: dict,
+    cached_context: dict[str, torch.Tensor] | None,
+) -> tuple[dict, dict[str, torch.Tensor]]:
+    """Apply connection-local scheduling context to one select request."""
+    include_context = bool(request.pop("include_context"))
+    if include_context:
+        cached_context = {name: request[name] for name in SELECT_CONTEXT_TENSORS}
+    elif cached_context is None:
+        raise RuntimeError("Raw select requested context reuse before initialization")
+    else:
+        request.update(cached_context)
+    return request, cached_context
 
 
 class RemoteIndexerWorker:
@@ -316,6 +332,7 @@ def serve(args: argparse.Namespace) -> None:
                 ),
                 flush=True,
             )
+            select_context = None
             while True:
                 message_kind = _recv_exact(connection, 1)
                 worker.apply_profile_control()
@@ -327,6 +344,9 @@ def serve(args: argparse.Namespace) -> None:
                     try:
                         request = recv_raw_select_request(
                             connection, worker.host_buffer
+                        )
+                        request, select_context = _resolve_select_context(
+                            request, select_context
                         )
                         request_id = int(request["request_id"])
                         topk = worker.select(request)

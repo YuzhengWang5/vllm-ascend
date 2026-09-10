@@ -8,6 +8,7 @@ from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.remote_indexer import
     CONTROL_MESSAGE,
     MAX_MESSAGE_BYTES,
     RemoteIndexerClient,
+    SELECT_CONTEXT_TENSORS,
     SELECT_MESSAGE,
     _recv_exact,
     _run_graph_callback,
@@ -17,6 +18,9 @@ from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.remote_indexer import
     send_framed,
     send_raw_select_request,
     send_raw_select_response,
+)
+from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.remote_indexer_service import (
+    _resolve_select_context,
 )
 
 
@@ -66,8 +70,27 @@ def test_raw_select_request_and_response_round_trip():
 
     assert request["request_id"] == 17
     assert request["layer_id"] == 4
+    assert request["include_context"] is True
     for name, expected in tensors.items():
         torch.testing.assert_close(request[name], expected)
+
+    thread = threading.Thread(
+        target=send_raw_select_request,
+        args=(sender, 18, 5, tensors),
+        kwargs={"include_context": False},
+    )
+    thread.start()
+    assert _recv_exact(receiver, 1) == SELECT_MESSAGE
+    reuse_request = recv_raw_select_request(
+        receiver,
+        lambda _name, shape, dtype: torch.empty(shape, dtype=dtype),
+    )
+    thread.join()
+    assert reuse_request["request_id"] == 18
+    assert reuse_request["layer_id"] == 5
+    assert reuse_request["include_context"] is False
+    for name in SELECT_CONTEXT_TENSORS:
+        assert name not in reuse_request
 
     topk = torch.arange(10, dtype=torch.int32).view(2, 1, 5)
     output = torch.empty_like(topk)
@@ -81,6 +104,29 @@ def test_raw_select_request_and_response_round_trip():
     torch.testing.assert_close(output, topk)
     sender.close()
     receiver.close()
+
+
+def test_resolve_select_context_requires_initialization_and_reuses_values():
+    with pytest.raises(RuntimeError, match="before initialization"):
+        _resolve_select_context({"include_context": False, "layer_id": 1}, None)
+
+    context = {
+        "slot_mapping": torch.tensor([7, 9]),
+        "actual_seq_lengths_query": torch.tensor([1, 2], dtype=torch.int32),
+        "actual_seq_lengths_key": torch.tensor([129, 130], dtype=torch.int32),
+        "block_table": torch.tensor([[0, 1], [2, 3]], dtype=torch.int32),
+    }
+    full_request = {"include_context": True, "layer_id": 0, **context}
+    resolved, cached = _resolve_select_context(full_request, None)
+    assert resolved is full_request
+    for name in SELECT_CONTEXT_TENSORS:
+        assert cached[name] is context[name]
+
+    reuse_request = {"include_context": False, "layer_id": 1}
+    resolved, reused_cache = _resolve_select_context(reuse_request, cached)
+    assert reused_cache is cached
+    for name in SELECT_CONTEXT_TENSORS:
+        assert resolved[name] is context[name]
 
 
 def test_graph_callback_dispatches_to_rank_local_client(monkeypatch):
@@ -144,7 +190,7 @@ def test_reset_cache_uses_rank_local_connection():
     server_sock.close()
 
     assert received == [
-        {"op": "reset_cache", "version": 2, "rank": 5},
+        {"op": "reset_cache", "version": 3, "rank": 5},
     ]
 
 
@@ -175,7 +221,7 @@ def test_fill_blocks_uses_rank_local_connection_and_deduplicates():
     assert received == [
         {
             "op": "fill_blocks",
-            "version": 2,
+            "version": 3,
             "rank": 6,
             "block_ids": [3, 7],
         },

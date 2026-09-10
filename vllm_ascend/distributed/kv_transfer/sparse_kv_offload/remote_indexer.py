@@ -19,15 +19,29 @@ import torch_npu
 from vllm.logger import logger
 
 
-PROTOCOL_VERSION = 2
+PROTOCOL_VERSION = 3
 MAX_MESSAGE_BYTES = 1 << 30
 _LENGTH = struct.Struct("!Q")
 CONTROL_MESSAGE = b"C"
 SELECT_MESSAGE = b"S"
-_SELECT_HEADER = struct.Struct("!Qi10I")
+_SELECT_HEADER = struct.Struct("!Qi11I")
 _SELECT_RESPONSE_HEADER = struct.Struct("!BQ")
 _SELECT_OK = 1
 _SELECT_ERROR = 0
+_SELECT_FLAG_CONTEXT = 1
+SELECT_DYNAMIC_TENSORS = (
+    "q",
+    "q_scale",
+    "weights",
+    "new_k",
+    "new_k_scale",
+)
+SELECT_CONTEXT_TENSORS = (
+    "slot_mapping",
+    "actual_seq_lengths_query",
+    "actual_seq_lengths_key",
+    "block_table",
+)
 _GRAPH_CLIENTS: dict[int, "RemoteIndexerClient"] = {}
 
 
@@ -110,16 +124,14 @@ def send_raw_select_request(
     request_id: int,
     layer_id: int,
     tensors: dict[str, torch.Tensor],
+    *,
+    include_context: bool = True,
 ) -> None:
     q = tensors["q"]
     q_scale = tensors["q_scale"]
     weights = tensors["weights"]
     new_k = tensors["new_k"]
     new_k_scale = tensors["new_k_scale"]
-    slot_mapping = tensors["slot_mapping"]
-    query_lens = tensors["actual_seq_lengths_query"]
-    key_lens = tensors["actual_seq_lengths_key"]
-    block_table = tensors["block_table"]
     if q.ndim != 3 or q.dtype != torch.int8:
         raise ValueError(f"Raw select expects int8 q[T,H,D], got {q.shape}/{q.dtype}")
     tokens, heads, dim = q.shape
@@ -131,45 +143,46 @@ def send_raw_select_request(
         raise ValueError("Raw select expects int8 new_k[N,D]")
     if new_k_scale.shape != (new_k.shape[0], 1) or new_k_scale.dtype != torch.float16:
         raise ValueError("Raw select expects FP16 new_k_scale[N,1]")
-    if slot_mapping.dtype not in {torch.int32, torch.int64}:
-        raise ValueError("Raw select expects int32/int64 slot_mapping")
-    if query_lens.dtype != torch.int32 or key_lens.dtype != torch.int32:
-        raise ValueError("Raw select expects int32 sequence lengths")
-    if block_table.ndim != 2 or block_table.dtype != torch.int32:
-        raise ValueError("Raw select expects int32 block_table[B,M]")
+    if include_context:
+        slot_mapping = tensors["slot_mapping"]
+        query_lens = tensors["actual_seq_lengths_query"]
+        key_lens = tensors["actual_seq_lengths_key"]
+        block_table = tensors["block_table"]
+        if slot_mapping.dtype not in {torch.int32, torch.int64}:
+            raise ValueError("Raw select expects int32/int64 slot_mapping")
+        if query_lens.dtype != torch.int32 or key_lens.dtype != torch.int32:
+            raise ValueError("Raw select expects int32 sequence lengths")
+        if block_table.ndim != 2 or block_table.dtype != torch.int32:
+            raise ValueError("Raw select expects int32 block_table[B,M]")
+        context_shape = (
+            slot_mapping.numel(),
+            query_lens.numel(),
+            key_lens.numel(),
+            block_table.shape[0],
+            block_table.shape[1],
+            slot_mapping.element_size(),
+        )
+    else:
+        context_shape = (0, 0, 0, 0, 0, 0)
     header = _SELECT_HEADER.pack(
         request_id,
         layer_id,
+        _SELECT_FLAG_CONTEXT if include_context else 0,
         tokens,
         heads,
         dim,
         new_k.shape[0],
-        slot_mapping.numel(),
-        query_lens.numel(),
-        key_lens.numel(),
-        block_table.shape[0],
-        block_table.shape[1],
-        slot_mapping.element_size(),
+        *context_shape,
     )
+    tensor_names = SELECT_DYNAMIC_TENSORS
+    if include_context:
+        tensor_names += SELECT_CONTEXT_TENSORS
     _send_views(
         sock,
         [
             SELECT_MESSAGE,
             header,
-            *(
-                _tensor_bytes(tensors[name])
-                for name in (
-                    "q",
-                    "q_scale",
-                    "weights",
-                    "new_k",
-                    "new_k_scale",
-                    "slot_mapping",
-                    "actual_seq_lengths_query",
-                    "actual_seq_lengths_key",
-                    "block_table",
-                )
-            ),
+            *(_tensor_bytes(tensors[name]) for name in tensor_names),
         ],
     )
 
@@ -181,6 +194,7 @@ def recv_raw_select_request(
     values = _SELECT_HEADER.unpack(_recv_exact(sock, _SELECT_HEADER.size))
     request_id, layer_id = values[:2]
     (
+        flags,
         tokens,
         heads,
         dim,
@@ -192,20 +206,30 @@ def recv_raw_select_request(
         block_cols,
         slot_width,
     ) = values[2:]
-    slot_dtype = {4: torch.int32, 8: torch.int64}.get(slot_width)
-    if slot_dtype is None:
-        raise ValueError(f"Unsupported slot_mapping element size: {slot_width}")
-    specs = (
+    if flags & ~_SELECT_FLAG_CONTEXT:
+        raise ValueError(f"Unsupported raw select flags: {flags:#x}")
+    include_context = bool(flags & _SELECT_FLAG_CONTEXT)
+    specs = [
         ("q", (tokens, heads, dim), torch.int8),
         ("q_scale", (tokens, heads), torch.float16),
         ("weights", (tokens, heads), torch.float16),
         ("new_k", (new_rows, dim), torch.int8),
         ("new_k_scale", (new_rows, 1), torch.float16),
-        ("slot_mapping", (slot_count,), slot_dtype),
-        ("actual_seq_lengths_query", (query_len_count,), torch.int32),
-        ("actual_seq_lengths_key", (key_len_count,), torch.int32),
-        ("block_table", (block_rows, block_cols), torch.int32),
-    )
+    ]
+    if include_context:
+        slot_dtype = {4: torch.int32, 8: torch.int64}.get(slot_width)
+        if slot_dtype is None:
+            raise ValueError(
+                f"Unsupported slot_mapping element size: {slot_width}"
+            )
+        specs.extend(
+            [
+                ("slot_mapping", (slot_count,), slot_dtype),
+                ("actual_seq_lengths_query", (query_len_count,), torch.int32),
+                ("actual_seq_lengths_key", (key_len_count,), torch.int32),
+                ("block_table", (block_rows, block_cols), torch.int32),
+            ]
+        )
     tensors = {}
     total_bytes = 0
     for name, shape, dtype in specs:
@@ -215,7 +239,12 @@ def recv_raw_select_request(
             raise ValueError("Raw select payload is too large")
         _recv_into_tensor(sock, tensor)
         tensors[name] = tensor
-    return {"request_id": request_id, "layer_id": layer_id, **tensors}
+    return {
+        "request_id": request_id,
+        "layer_id": layer_id,
+        "include_context": include_context,
+        **tensors,
+    }
 
 
 def send_raw_select_response(
@@ -450,5 +479,11 @@ class RemoteIndexerClient:
             sock = self._connect()
             request_id = self._request_id
             self._request_id += 1
-            send_raw_select_request(sock, request_id, layer_id, staged)
+            send_raw_select_request(
+                sock,
+                request_id,
+                layer_id,
+                staged,
+                include_context=layer_id == 0,
+            )
             recv_raw_select_response(sock, request_id, output_cpu)
