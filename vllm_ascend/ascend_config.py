@@ -1038,6 +1038,24 @@ class SparseKVOffloadConfig:
         self.topk_buffer_size = int(user_config.get("topk_buffer_size", 4096))
         self.dram_size_per_dp_GB = int(user_config.get("dram_size_per_dp_GB", 128))
         self.keep_device_kv_cache = bool(user_config.get("keep_device_kv_cache", False))
+        self.motivation_baseline = str(
+            user_config.get("motivation_baseline", "colocated")
+        )
+        self.motivation_force_oracle_trace = bool(
+            user_config.get("motivation_force_oracle_trace", False)
+        )
+        supported_motivation_baselines = {
+            "colocated",
+            "no_index_compute",
+            "no_index_state",
+            "no_gather",
+        }
+        if self.motivation_baseline not in supported_motivation_baselines:
+            raise ValueError(
+                "sparse_kv_offload_config.motivation_baseline must be one of "
+                f"{sorted(supported_motivation_baselines)}, got "
+                f"{self.motivation_baseline!r}"
+            )
 
         if hasattr(vllm_config.model_config.hf_text_config, "compress_ratios"):
             raise ValueError("Sparse KV offload don't support compress now.")

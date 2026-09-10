@@ -327,6 +327,7 @@ class SparseKVOffloadManager:
         self.block_size = self._infer_group_block_sizes(self.kv_cache_config)
         self.topk_buffer_size = sparse_kv_offload_config.topk_buffer_size
         self.topk = sparse_kv_offload_config.topk
+        self.motivation_baseline = sparse_kv_offload_config.motivation_baseline
 
         self.max_num_reqs = vllm_config.scheduler_config.max_num_seqs
         self.max_num_tokens = vllm_config.scheduler_config.max_num_batched_tokens
@@ -518,6 +519,12 @@ class SparseKVOffloadManager:
             dtype=torch.int32,
             device=device,
         )
+        self.motivation_oracle_topk_npu = torch.arange(
+            self.topk,
+            dtype=torch.int32,
+            device=device,
+        ).view(1, -1).repeat(self.max_num_topk_rows, 1)
+        self.current_slots_npu.copy_(self.motivation_oracle_topk_npu)
         self.resident_block_table_npu = torch.arange(
             self.max_num_topk_rows * pages_per_row,
             dtype=torch.int32,
@@ -761,6 +768,30 @@ class SparseKVOffloadManager:
         self.lru_miss_position_workspace_ptr = self.lru_miss_position_workspace.data_ptr()
         self.lru_epochs_ptr = self.lru_epochs.data_ptr()
 
+    def get_motivation_oracle_topk(self, num_tokens: int) -> torch.Tensor:
+        if num_tokens > self.max_num_topk_rows:
+            raise ValueError(
+                "Motivation oracle rows exceed configured workspace, "
+                f"num_tokens={num_tokens}, capacity={self.max_num_topk_rows}"
+            )
+        return self.motivation_oracle_topk_npu[:num_tokens].unsqueeze(1)
+
+    def prepare_motivation_no_gather_buffers(self, fill_value: float) -> None:
+        if self.motivation_baseline != "no_gather":
+            return
+        for k_buffer, v_buffer in zip(
+            self.topk_buffers_k,
+            self.topk_buffers_v,
+        ):
+            k_buffer[:, : self.topk].fill_(fill_value)
+            v_buffer[:, : self.topk].fill_(fill_value)
+        self.current_slots_npu.copy_(self.motivation_oracle_topk_npu)
+        torch_npu.npu.synchronize()
+        logger.warning_once(
+            "Motivation NoGather prefilled resident KV buffers with %.6f",
+            fill_value,
+        )
+
     def offload_new_kv(
         self,
         slot_mapping: torch.Tensor,
@@ -875,6 +906,12 @@ class SparseKVOffloadManager:
                 "Sparse KV offload topk rows exceed configured workspace, "
                 f"num_tokens={num_tokens}, max_num_topk_rows={self.max_num_topk_rows}"
             )
+        if self.motivation_baseline == "no_gather":
+            current_slots_npu[:num_tokens].copy_(
+                self.motivation_oracle_topk_npu[:num_tokens],
+                non_blocking=capturing,
+            )
+            return
         if layer_id in [0, self.mtp_layer_id]:
             # metadata which are same across all layers, only compute/copy once in first layer.
             # last layer (mtp layer) may have different metadata, do not skip.

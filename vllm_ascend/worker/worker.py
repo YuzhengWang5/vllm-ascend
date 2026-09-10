@@ -617,6 +617,16 @@ class NPUWorker(WorkerBase):
         if not sparse_kv_offload_config.enabled:
             return available_memory
         keep_device_kv_cache = sparse_kv_offload_config.keep_device_kv_cache
+        if sparse_kv_offload_config.motivation_baseline in {
+            "no_index_state",
+            "no_gather",
+        }:
+            if self.cache_config.num_gpu_blocks_override is None:
+                raise ValueError(
+                    "NoIndexState/NoGather requires num_gpu_blocks_override "
+                    "because no device KV spec remains to size the host pool."
+                )
+            return available_memory
         if keep_device_kv_cache:
             needed_dram_size_bytes = available_memory
         else:

@@ -4883,6 +4883,13 @@ class NPUModelRunner(GPUModelRunner):
                     attn_layer_names.add(layer_name)
 
             elif isinstance(attn_module, DeepseekV32IndexerCache):
+                motivation_baseline = getattr(
+                    self.ascend_config.sparse_kv_offload_config,
+                    "motivation_baseline",
+                    "colocated",
+                )
+                if motivation_baseline in {"no_index_state", "no_gather"}:
+                    continue
                 # TODO: This mirrors upstream's separated KV/indexer specs for
                 # SFA, but keeps Ascend-specific shape/block-size accounting.
                 # Remove this special case once the generic vLLM spec/backend

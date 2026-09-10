@@ -43,6 +43,7 @@ from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.sparse_kv_offload_man
     OFFLOAD_K_CACHE_NPU_INDEX,
     OFFLOAD_KV_CACHE_TUPLE_LEN,
     OFFLOAD_V_CACHE_NPU_INDEX,
+    get_sparse_kv_offload_manager,
 )
 from vllm_ascend.distributed.utils import all_gather_async
 from vllm_ascend.memcache_comm_fence import (
@@ -581,6 +582,26 @@ class AscendSFAImpl(MLAAttentionImpl):
         ) or _has_shared_indexer_layers(config_candidates)
         self.use_index_cache = self.skip_topk or self.index_cache_enabled
         self.has_indexer = self.indexer is not None
+        sparse_config = get_ascend_config().sparse_kv_offload_config
+        self.motivation_baseline = getattr(
+            sparse_config,
+            "motivation_baseline",
+            "colocated",
+        )
+        self.motivation_use_oracle_topk = self.motivation_baseline in {
+            "no_index_compute",
+            "no_index_state",
+            "no_gather",
+        }
+        self.motivation_force_oracle_trace = getattr(
+            sparse_config,
+            "motivation_force_oracle_trace",
+            False,
+        )
+        self.motivation_no_index_state = self.motivation_baseline in {
+            "no_index_state",
+            "no_gather",
+        }
         if not self.has_indexer and not self.skip_topk:
             raise ValueError(
                 "Indexer is required for DSA unless skip_topk is enabled. "
@@ -1790,6 +1811,8 @@ class AscendSFAImpl(MLAAttentionImpl):
         main_cache = kv_cache
         if main_cache is None or not self.has_indexer:
             return main_cache
+        if self.motivation_no_index_state:
+            return main_cache
 
         # Sparse KV offload registers the main MLA cache as a 6-tuple
         # (k_npu, v_npu, k_cpu, v_cpu, topk_buffer_k, topk_buffer_v); the
@@ -1978,7 +2001,11 @@ class AscendSFAImpl(MLAAttentionImpl):
                 assert k_li is not None
                 k_li = self._get_full_kv(k_li, attn_metadata)
 
-        if kv_cache is not None and self.has_indexer:
+        if (
+            kv_cache is not None
+            and self.has_indexer
+            and not self.motivation_use_oracle_topk
+        ):
             assert k_li is not None
             use_li_c8_reshape_optim = self._use_li_c8_reshape_optim()
             dsa_k_cache_idx = self.kv_cache_indexer_k_idx
@@ -2033,7 +2060,10 @@ class AscendSFAImpl(MLAAttentionImpl):
         # inside indexer_select_post_process would leave their gate closed.
         record_attention_compute_start()
 
-        if self.skip_topk:
+        if self.motivation_use_oracle_topk:
+            manager = get_sparse_kv_offload_manager()
+            topk_indices = manager.get_motivation_oracle_topk(topk_num_tokens)
+        elif self.skip_topk:
             topk_indices = self._get_indexcache_topk_indices(topk_num_tokens)
         else:
             if not self.has_indexer:
@@ -2049,6 +2079,15 @@ class AscendSFAImpl(MLAAttentionImpl):
                 actual_seq_lengths_query=actual_seq_lengths_query,
                 actual_seq_lengths_key=actual_seq_lengths_key,
             )
+            # Motivation runs execute the real index scan/score/top-k above,
+            # then replace its output with the same deterministic trace used
+            # by the ablations. This keeps B1 index compute in the graph while
+            # making gather/cache-hit behavior identical across B1--B4.
+            if self.motivation_force_oracle_trace:
+                manager = get_sparse_kv_offload_manager()
+                topk_indices = manager.get_motivation_oracle_topk(
+                    topk_num_tokens,
+                )
             if self.use_index_cache:
                 self._update_indexcache_topk_indices(topk_indices)
 

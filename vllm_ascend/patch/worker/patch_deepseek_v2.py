@@ -23,6 +23,7 @@ from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.models.deepseek_v2 import (
     DeepSeekV2FusedQkvAProjLinear,
+    DeepseekV32IndexerCache,
     DeepseekV2MLAAttention,
     DeepseekV2Model,
     Indexer,
@@ -31,6 +32,22 @@ from vllm.model_executor.models.deepseek_v2 import (
 )
 from vllm.model_executor.models.utils import extract_layer_index
 from vllm.sequence import IntermediateTensors
+
+from vllm_ascend.ascend_config import get_ascend_config
+
+
+_ORIGINAL_INDEXER_GET_KV_CACHE_SPEC = DeepseekV32IndexerCache.get_kv_cache_spec
+
+
+def _indexer_get_kv_cache_spec(self, vllm_config: VllmConfig):
+    sparse_config = get_ascend_config().sparse_kv_offload_config
+    baseline = getattr(sparse_config, "motivation_baseline", "colocated")
+    if baseline in {"no_index_state", "no_gather"}:
+        return None
+    return _ORIGINAL_INDEXER_GET_KV_CACHE_SPEC(self, vllm_config)
+
+
+DeepseekV32IndexerCache.get_kv_cache_spec = _indexer_get_kv_cache_spec
 
 
 def _should_skip_indexer_init(
