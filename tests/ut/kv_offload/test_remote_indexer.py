@@ -45,6 +45,12 @@ def test_framed_torch_payload_round_trip():
 
 def test_raw_select_request_and_response_round_trip():
     sender, receiver = socket.socketpair()
+    allocations = []
+
+    def get_buffer(name, shape, dtype):
+        allocations.append((name, shape, dtype))
+        return torch.empty(shape, dtype=dtype)
+
     tensors = {
         "q": torch.arange(24, dtype=torch.int8).view(2, 3, 4),
         "q_scale": torch.arange(6, dtype=torch.float16).view(2, 3),
@@ -64,7 +70,7 @@ def test_raw_select_request_and_response_round_trip():
     assert _recv_exact(receiver, 1) == SELECT_MESSAGE
     request = recv_raw_select_request(
         receiver,
-        lambda _name, shape, dtype: torch.empty(shape, dtype=dtype),
+        get_buffer,
     )
     thread.join()
 
@@ -73,6 +79,8 @@ def test_raw_select_request_and_response_round_trip():
     assert request["include_context"] is True
     for name, expected in tensors.items():
         torch.testing.assert_close(request[name], expected)
+    assert allocations[-1][0] == "packed_select_payload"
+    assert len(allocations) == 1
 
     thread = threading.Thread(
         target=send_raw_select_request,
@@ -83,7 +91,7 @@ def test_raw_select_request_and_response_round_trip():
     assert _recv_exact(receiver, 1) == SELECT_MESSAGE
     reuse_request = recv_raw_select_request(
         receiver,
-        lambda _name, shape, dtype: torch.empty(shape, dtype=dtype),
+        get_buffer,
     )
     thread.join()
     assert reuse_request["request_id"] == 18
@@ -91,6 +99,8 @@ def test_raw_select_request_and_response_round_trip():
     assert reuse_request["include_context"] is False
     for name in SELECT_CONTEXT_TENSORS:
         assert name not in reuse_request
+    assert allocations[-1][0] == "packed_select_payload"
+    assert len(allocations) == 2
 
     topk = torch.arange(10, dtype=torch.int32).view(2, 1, 5)
     output = torch.empty_like(topk)

@@ -177,12 +177,23 @@ def send_raw_select_request(
     tensor_names = SELECT_DYNAMIC_TENSORS
     if include_context:
         tensor_names += SELECT_CONTEXT_TENSORS
+    payload_views: list[bytes | memoryview] = []
+    payload_offset = 0
+    for name in tensor_names:
+        tensor = tensors[name]
+        padding = (-payload_offset) % tensor.element_size()
+        if padding:
+            payload_views.append(bytes(padding))
+            payload_offset += padding
+        tensor_view = _tensor_bytes(tensor)
+        payload_views.append(tensor_view)
+        payload_offset += len(tensor_view)
     _send_views(
         sock,
         [
             SELECT_MESSAGE,
             header,
-            *(_tensor_bytes(tensors[name]) for name in tensor_names),
+            *payload_views,
         ],
     )
 
@@ -230,14 +241,25 @@ def recv_raw_select_request(
                 ("block_table", (block_rows, block_cols), torch.int32),
             ]
         )
-    tensors = {}
+    tensor_layout = []
     total_bytes = 0
     for name, shape, dtype in specs:
-        tensor = buffer_getter(name, shape, dtype)
-        total_bytes += tensor.numel() * tensor.element_size()
+        elements = 1
+        for dimension in shape:
+            elements *= dimension
+        element_size = torch.empty((), dtype=dtype).element_size()
+        size_bytes = elements * element_size
+        offset = total_bytes + (-total_bytes) % element_size
+        tensor_layout.append((name, shape, dtype, offset, size_bytes))
+        total_bytes = offset + size_bytes
         if total_bytes > MAX_MESSAGE_BYTES:
             raise ValueError("Raw select payload is too large")
-        _recv_into_tensor(sock, tensor)
+    packed = buffer_getter("packed_select_payload", (total_bytes,), torch.uint8)
+    _recv_into_tensor(sock, packed)
+
+    tensors = {}
+    for name, shape, dtype, offset, size_bytes in tensor_layout:
+        tensor = packed.narrow(0, offset, size_bytes).view(dtype).view(shape)
         tensors[name] = tensor
     return {
         "request_id": request_id,
