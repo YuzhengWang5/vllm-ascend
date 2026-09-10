@@ -119,12 +119,14 @@ def test_resolve_select_context_requires_initialization_and_reuses_values():
     full_request = {"include_context": True, "layer_id": 0, **context}
     resolved, cached = _resolve_select_context(full_request, None)
     assert resolved is full_request
+    assert resolved["_context_updated"] is True
     for name in SELECT_CONTEXT_TENSORS:
         assert cached[name] is context[name]
 
     reuse_request = {"include_context": False, "layer_id": 1}
     resolved, reused_cache = _resolve_select_context(reuse_request, cached)
     assert reused_cache is cached
+    assert resolved["_context_updated"] is False
     for name in SELECT_CONTEXT_TENSORS:
         assert resolved[name] is context[name]
 

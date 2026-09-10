@@ -34,6 +34,7 @@ def _resolve_select_context(
 ) -> tuple[dict, dict[str, torch.Tensor]]:
     """Apply connection-local scheduling context to one select request."""
     include_context = bool(request.pop("include_context"))
+    request["_context_updated"] = include_context
     if include_context:
         cached_context = {name: request[name] for name in SELECT_CONTEXT_TENSORS}
     elif cached_context is None:
@@ -70,6 +71,7 @@ class RemoteIndexerWorker:
         self.host_buffers: dict[
             tuple[str, tuple[int, ...], torch.dtype], torch.Tensor
         ] = {}
+        self.device_context: dict[str, torch.Tensor] | None = None
         self._profiler = None
         self._profile_active = False
         self._profile_start_requested = False
@@ -177,6 +179,10 @@ class RemoteIndexerWorker:
             self.host_buffers[key] = buffer
         return buffer
 
+    def clear_device_context(self) -> None:
+        """Prevent a new connection from inheriting scheduling state."""
+        self.device_context = None
+
     def reset_cache(self) -> None:
         """Undo cache writes performed by the graph's capture execution."""
         for key, scale in self.caches.values():
@@ -214,24 +220,46 @@ class RemoteIndexerWorker:
         torch.npu.synchronize()
 
     def select(self, request: dict) -> torch.Tensor:
-        valid_block_ids = request["block_table"][request["block_table"] >= 0]
-        if valid_block_ids.numel() > 0:
-            largest_block_id = int(valid_block_ids.max().item())
-            if largest_block_id >= self.cache_blocks:
-                raise ValueError(
-                    "Remote index cache is too small: "
-                    f"largest block id={largest_block_id}, "
-                    f"cache_blocks={self.cache_blocks}"
-                )
+        context_updated = bool(request.pop("_context_updated"))
+        if context_updated:
+            valid_block_ids = request["block_table"][request["block_table"] >= 0]
+            if valid_block_ids.numel() > 0:
+                largest_block_id = int(valid_block_ids.max().item())
+                if largest_block_id >= self.cache_blocks:
+                    raise ValueError(
+                        "Remote index cache is too small: "
+                        f"largest block id={largest_block_id}, "
+                        f"cache_blocks={self.cache_blocks}"
+                    )
+            old_context = self.device_context or {}
+            device_context = {}
+            for name in SELECT_CONTEXT_TENSORS:
+                host_tensor = request[name]
+                device_tensor = old_context.get(name)
+                if (
+                    device_tensor is None
+                    or device_tensor.shape != host_tensor.shape
+                    or device_tensor.dtype != host_tensor.dtype
+                ):
+                    device_tensor = torch.empty_like(host_tensor, device="npu")
+                device_tensor.copy_(host_tensor, non_blocking=True)
+                device_context[name] = device_tensor
+            self.device_context = device_context
+        elif self.device_context is None:
+            raise RuntimeError("NPU scheduling context is not initialized")
+
+        assert self.device_context is not None
         q = request["q"].to("npu")
         q_scale = request["q_scale"].to("npu")
         weights = request["weights"].to("npu")
         new_k = request["new_k"].to("npu")
         new_k_scale = request["new_k_scale"].to("npu")
-        slot_mapping = request["slot_mapping"].to("npu")
-        actual_seq_lengths_query = request["actual_seq_lengths_query"].to("npu")
-        actual_seq_lengths_key = request["actual_seq_lengths_key"].to("npu")
-        block_table = request["block_table"].to("npu")
+        slot_mapping = self.device_context["slot_mapping"]
+        actual_seq_lengths_query = self.device_context[
+            "actual_seq_lengths_query"
+        ]
+        actual_seq_lengths_key = self.device_context["actual_seq_lengths_key"]
+        block_table = self.device_context["block_table"]
 
         key_cache, scale_cache = self._cache(int(request["layer_id"]))
         # Match the colocated SFA path exactly.  In particular, the Ascend
@@ -333,6 +361,7 @@ def serve(args: argparse.Namespace) -> None:
                 flush=True,
             )
             select_context = None
+            worker.clear_device_context()
             while True:
                 message_kind = _recv_exact(connection, 1)
                 worker.apply_profile_control()
