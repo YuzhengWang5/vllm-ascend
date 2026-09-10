@@ -18,7 +18,7 @@ import torch
 import torch_npu
 from vllm.logger import logger
 
-PROTOCOL_VERSION = 9
+PROTOCOL_VERSION = 10
 MAX_MESSAGE_BYTES = 1 << 30
 _LENGTH = struct.Struct("!Q")
 CONTROL_MESSAGE = b"C"
@@ -271,6 +271,7 @@ class RemoteIndexerClient:
         self.memfabric_store_url = memfabric_store_url
         self._socket: socket.socket | None = None
         self._mailbox = None
+        self._local_shm = None
         self._buffers: dict[tuple[str, tuple[int, ...], torch.dtype], torch.Tensor] = {}
         self._lock = threading.Lock()
         self._request_id = 0
@@ -338,7 +339,13 @@ class RemoteIndexerClient:
             hello["memfabric_store_url"] = self.memfabric_store_url
         send_framed(sock, hello)
         response = recv_framed(sock)
-        expected_transport = "memfabric_mailbox" if self.transport == "memfabric_mailbox" else "raw"
+        expected_transport = {
+            "raw_tcp": "raw",
+            "memfabric_mailbox": "memfabric_mailbox",
+            "shm_mailbox": "shm_mailbox",
+        }.get(self.transport)
+        if expected_transport is None:
+            raise ValueError(f"Unsupported remote indexer transport: {self.transport}")
         if response != {
             "ok": True,
             "version": PROTOCOL_VERSION,
@@ -381,6 +388,13 @@ class RemoteIndexerClient:
             ready = recv_framed(sock)
             if ready != {"ok": True, "mailbox_ready": True}:
                 raise RuntimeError(f"Remote indexer mailbox bootstrap failed: {ready!r}")
+        elif self.transport == "shm_mailbox":
+            from .local_shm_mailbox import LocalShmMailboxClient, default_shm_path
+
+            self._local_shm = LocalShmMailboxClient(
+                default_shm_path(self.rank),
+                timeout_s=self.connect_timeout_s,
+            )
         self._socket = sock
         logger.warning(
             "Remote indexer rank %d connected to %s:%d",
@@ -481,7 +495,14 @@ class RemoteIndexerClient:
             sock = self._connect()
             request_id = self._request_id
             self._request_id += 1
-            if self._mailbox is None:
+            if self._local_shm is not None:
+                self._local_shm.select(
+                    request_id + 1,
+                    layer_id,
+                    staged,
+                    output_cpu,
+                )
+            elif self._mailbox is None:
                 send_raw_select_request(sock, request_id, layer_id, staged)
                 recv_raw_select_response(sock, request_id, output_cpu)
             else:

@@ -1069,10 +1069,14 @@ class SparseKVOffloadConfig:
             )
         if self.remote_indexer_connect_timeout_s <= 0:
             raise ValueError("sparse_kv_offload_config.remote_indexer_connect_timeout_s must be positive")
-        if self.remote_indexer_transport not in {"raw_tcp", "memfabric_mailbox"}:
+        if self.remote_indexer_transport not in {
+            "raw_tcp",
+            "memfabric_mailbox",
+            "shm_mailbox",
+        }:
             raise ValueError(
                 "sparse_kv_offload_config.remote_indexer_transport must be "
-                "'raw_tcp' or 'memfabric_mailbox', got "
+                "'raw_tcp', 'memfabric_mailbox' or 'shm_mailbox', got "
                 f"{self.remote_indexer_transport!r}"
             )
         if not 1 <= self.remote_indexer_memfabric_store_base_port <= 65520:

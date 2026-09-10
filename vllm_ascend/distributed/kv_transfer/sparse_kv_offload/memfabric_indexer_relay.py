@@ -11,12 +11,14 @@ from __future__ import annotations
 
 import argparse
 import json
+import select as io_select
 import socket
 import time
 import traceback
 
 import torch
 
+from .local_shm_mailbox import LocalShmMailboxServer, default_shm_path
 from .memfabric_mailbox import MemfabricMailboxClient
 from .remote_indexer import (
     CONTROL_MESSAGE,
@@ -124,13 +126,14 @@ def _serve_decoder(
     rank: int,
     topk: int,
     log_every: int,
+    local_mailbox: LocalShmMailboxServer | None,
 ) -> None:
     hello = recv_framed(inbound)
     expected = {
         "op": "hello",
         "version": PROTOCOL_VERSION,
         "rank": rank,
-        "select_transport": "raw_tcp",
+        "select_transport": "shm_mailbox" if local_mailbox else "raw_tcp",
     }
     if hello != expected:
         raise RuntimeError(f"Decoder handshake mismatch: {hello!r}")
@@ -139,12 +142,55 @@ def _serve_decoder(
         {
             "ok": True,
             "version": PROTOCOL_VERSION,
-            "select_transport": "raw",
+            "select_transport": "shm_mailbox" if local_mailbox else "raw",
         },
     )
     buffers = _HostBuffers()
     while True:
-        kind = _recv_exact(inbound, 1)
+        if local_mailbox is not None:
+            readable, _, _ = io_select.select([inbound], [], [], 0)
+            if readable:
+                kind = _recv_exact(inbound, 1)
+            else:
+                request = local_mailbox.try_receive(buffers.get)
+                if request is None:
+                    continue
+                request_id = int(request["request_id"])
+                try:
+                    started_at = time.perf_counter()
+                    output = buffers.get(
+                        "topk_response",
+                        (request["q"].shape[0], 1, topk),
+                        torch.int32,
+                    )
+                    mailbox.select(
+                        request_id,
+                        int(request["layer_id"]),
+                        request,
+                        output,
+                    )
+                    local_mailbox.respond(request_id, output)
+                    if request_id % log_every == 0:
+                        print(
+                            json.dumps(
+                                {
+                                    "event": "relay_select",
+                                    "local_transport": "shm_mailbox",
+                                    "rank": rank,
+                                    "request_id": request_id - 1,
+                                    "layer_id": int(request["layer_id"]),
+                                    "tokens": request["q"].shape[0],
+                                    "elapsed_ms": (time.perf_counter() - started_at) * 1000,
+                                }
+                            ),
+                            flush=True,
+                        )
+                except Exception:
+                    local_mailbox.respond_error(request_id)
+                    raise
+                continue
+        else:
+            kind = _recv_exact(inbound, 1)
         if kind == CONTROL_MESSAGE:
             _forward_control(inbound, outbound, rank)
             continue
@@ -195,6 +241,13 @@ def serve(args: argparse.Namespace) -> None:
         store_url=args.store_url,
         timeout_s=args.connect_timeout,
     )
+    local_mailbox = None
+    shm_path = args.shm_path or default_shm_path(args.rank)
+    if args.local_transport == "shm_mailbox":
+        local_mailbox = LocalShmMailboxServer(
+            shm_path,
+            timeout_s=args.connect_timeout,
+        )
     print(
         json.dumps(
             {
@@ -202,6 +255,8 @@ def serve(args: argparse.Namespace) -> None:
                 "rank": args.rank,
                 "remote": f"{args.remote_host}:{args.remote_port}",
                 "listen": f"{args.host}:{args.port}",
+                "local_transport": args.local_transport,
+                "shm_path": shm_path if local_mailbox else None,
             }
         ),
         flush=True,
@@ -224,6 +279,7 @@ def serve(args: argparse.Namespace) -> None:
                 rank=args.rank,
                 topk=args.topk,
                 log_every=args.log_every,
+                local_mailbox=local_mailbox,
             )
 
 
@@ -236,6 +292,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--rank", required=True, type=int)
     parser.add_argument("--device", required=True, type=int)
     parser.add_argument("--store-url", required=True)
+    parser.add_argument(
+        "--local-transport",
+        choices=("raw_tcp", "shm_mailbox"),
+        default="raw_tcp",
+    )
+    parser.add_argument("--shm-path", default="")
     parser.add_argument("--topk", default=2048, type=int)
     parser.add_argument("--connect-timeout", default=120.0, type=float)
     parser.add_argument("--log-every", default=100, type=int)
