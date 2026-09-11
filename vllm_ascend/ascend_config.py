@@ -1053,6 +1053,12 @@ class SparseKVOffloadConfig:
         self.remote_indexer_connect_timeout_s = float(
             user_config.get("remote_indexer_connect_timeout_s", 30.0)
         )
+        self.remote_indexer_transport = str(
+            user_config.get("remote_indexer_transport", "raw")
+        )
+        self.remote_indexer_shm_store = str(
+            user_config.get("remote_indexer_shm_store", "")
+        )
         self.remote_indexer_enabled = bool(self.remote_indexer_host)
         supported_motivation_baselines = {
             "colocated",
@@ -1076,6 +1082,19 @@ class SparseKVOffloadConfig:
             raise ValueError(
                 "sparse_kv_offload_config.remote_indexer_connect_timeout_s "
                 "must be positive"
+            )
+        if self.remote_indexer_transport not in {"raw", "shm"}:
+            raise ValueError(
+                "sparse_kv_offload_config.remote_indexer_transport must be "
+                f"'raw' or 'shm', got {self.remote_indexer_transport!r}"
+            )
+        if (
+            self.remote_indexer_enabled
+            and self.remote_indexer_transport == "shm"
+            and not self.remote_indexer_shm_store.startswith("tcp://")
+        ):
+            raise ValueError(
+                "SHM remote indexer requires remote_indexer_shm_store='tcp://host:port'"
             )
         if self.remote_indexer_enabled and self.motivation_baseline != "colocated":
             raise ValueError(

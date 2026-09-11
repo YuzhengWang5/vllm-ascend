@@ -331,28 +331,42 @@ class SparseKVOffloadManager:
         self.motivation_baseline = sparse_kv_offload_config.motivation_baseline
         self.remote_indexer_client = None
         if sparse_kv_offload_config.remote_indexer_enabled:
-            from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.remote_indexer import (
-                RemoteIndexerClient,
-            )
-
             remote_rank = self.dp_rank * self.tp_size + self.tp_rank
-            remote_port = (
-                sparse_kv_offload_config.remote_indexer_base_port
-                + remote_rank
-            )
-            if remote_port > 65535:
-                raise ValueError(
-                    f"Remote indexer rank-local port is invalid: {remote_port}"
+            if sparse_kv_offload_config.remote_indexer_transport == "shm":
+                from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.indexer_shm_transport import (
+                    ShmRemoteIndexerClient,
                 )
-            self.remote_indexer_client = RemoteIndexerClient(
-                host=sparse_kv_offload_config.remote_indexer_host,
-                port=remote_port,
-                rank=remote_rank,
-                topk=sparse_kv_offload_config.topk,
-                connect_timeout_s=(
-                    sparse_kv_offload_config.remote_indexer_connect_timeout_s
-                ),
-            )
+
+                decoder_world_size = parallel_config.data_parallel_size * self.tp_size
+                self.remote_indexer_client = ShmRemoteIndexerClient(
+                    store_url=sparse_kv_offload_config.remote_indexer_shm_store,
+                    decoder_world_size=decoder_world_size,
+                    rank=remote_rank,
+                    device=torch_npu.npu.current_device(),
+                    topk=sparse_kv_offload_config.topk,
+                )
+            else:
+                from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.remote_indexer import (
+                    RemoteIndexerClient,
+                )
+
+                remote_port = (
+                    sparse_kv_offload_config.remote_indexer_base_port
+                    + remote_rank
+                )
+                if remote_port > 65535:
+                    raise ValueError(
+                        f"Remote indexer rank-local port is invalid: {remote_port}"
+                    )
+                self.remote_indexer_client = RemoteIndexerClient(
+                    host=sparse_kv_offload_config.remote_indexer_host,
+                    port=remote_port,
+                    rank=remote_rank,
+                    topk=sparse_kv_offload_config.topk,
+                    connect_timeout_s=(
+                        sparse_kv_offload_config.remote_indexer_connect_timeout_s
+                    ),
+                )
 
         self.max_num_reqs = vllm_config.scheduler_config.max_num_seqs
         self.max_num_tokens = vllm_config.scheduler_config.max_num_batched_tokens
@@ -380,7 +394,10 @@ class SparseKVOffloadManager:
         self._npu_runtime = torch_npu.npu
 
         self._build_cpp()
-        if self.remote_indexer_client is not None:
+        if (
+            self.remote_indexer_client is not None
+            and sparse_kv_offload_config.remote_indexer_transport == "raw"
+        ):
             self.remote_indexer_client.set_graph_callback_enqueuer(
                 self.sparse_kv_offload_cpp.enqueue_remote_indexer_subscribed_callback
             )
