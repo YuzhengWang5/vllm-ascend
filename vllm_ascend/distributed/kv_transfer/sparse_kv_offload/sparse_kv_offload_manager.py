@@ -344,6 +344,9 @@ class SparseKVOffloadManager:
                     rank=remote_rank,
                     device=torch_npu.npu.current_device(),
                     topk=sparse_kv_offload_config.topk,
+                    profile_device=(
+                        sparse_kv_offload_config.remote_indexer_profile_device
+                    ),
                 )
             else:
                 from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.remote_indexer import (

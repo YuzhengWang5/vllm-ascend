@@ -162,8 +162,15 @@ class IndexerShmTransport:
         if self._handle.barrier() != 0:
             raise RuntimeError("MemFabric SHM barrier failed")
 
-    def decoder_exchange(self, request: torch.Tensor, response: torch.Tensor) -> None:
-        self._extension.decoder_exchange(
+    def decoder_exchange(
+        self,
+        request: torch.Tensor,
+        response: torch.Tensor,
+        *,
+        profiled: bool = False,
+    ) -> None:
+        exchange = self._extension.decoder_exchange_profiled if profiled else self._extension.decoder_exchange
+        exchange(
             request,
             response,
             self.gva,
@@ -175,9 +182,30 @@ class IndexerShmTransport:
     def service_receive(self, request: torch.Tensor) -> None:
         self._extension.service_receive(request, self.gva, self.symmetric_size, self.service_rank)
 
+    def service_receive_profiled(self, request: torch.Tensor, trace: torch.Tensor, layer_id: int) -> None:
+        self._extension.service_receive_profiled(
+            request,
+            trace,
+            layer_id,
+            self.gva,
+            self.symmetric_size,
+            self.service_rank,
+        )
+
     def service_respond(self, response: torch.Tensor) -> None:
         self._extension.service_respond(
             response,
+            self.gva,
+            self.symmetric_size,
+            self.decoder_rank,
+            self.service_rank,
+        )
+
+    def service_respond_profiled(self, response: torch.Tensor, trace: torch.Tensor, layer_id: int) -> None:
+        self._extension.service_respond_profiled(
+            response,
+            trace,
+            layer_id,
             self.gva,
             self.symmetric_size,
             self.decoder_rank,
@@ -205,9 +233,11 @@ class ShmRemoteIndexerClient:
         rank: int,
         device: int,
         topk: int,
+        profile_device: bool = False,
     ) -> None:
         self.rank = rank
         self.topk = topk
+        self.profile_device = profile_device
         self._transport = IndexerShmTransport(
             store_url=store_url,
             world_size=decoder_world_size * 2,
@@ -272,7 +302,7 @@ class ShmRemoteIndexerClient:
         if response is None:
             response = torch.empty(align32(response_bytes), dtype=torch.uint8, device=q.device)
             self._responses[tokens] = response
-        self._transport.decoder_exchange(request, response)
+        self._transport.decoder_exchange(request, response, profiled=self.profile_device)
         return response[:response_bytes].view(torch.int32).view(tokens, 1, self.topk)
 
     def set_graph_callback_enqueuer(self, enqueuer: object) -> None:

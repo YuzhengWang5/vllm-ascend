@@ -12,6 +12,8 @@ import torch_npu
 
 from .indexer_shm_transport import IndexerShmTransport, PackedTensors, align32
 
+A3_CYCLES_PER_US = 50.0
+
 
 def empty_request(args: argparse.Namespace, batch: int) -> dict[str, torch.Tensor]:
     return {
@@ -70,6 +72,32 @@ def metadata_summary(tensors: dict[str, torch.Tensor], cache_blocks: int, block_
     }
 
 
+def device_breakdown(trace: torch.Tensor, step: int) -> dict[str, object]:
+    """Decode same-die cycle deltas; absolute clocks are never compared."""
+    rows = trace.cpu().tolist()
+    layers: list[dict[str, float | int]] = []
+    for layer_id, row in enumerate(rows):
+        service = row[0:3] + row[4:7]
+        decoder = row[8:12]
+        if service != sorted(service) or decoder != sorted(decoder):
+            raise RuntimeError(f"non-monotonic device trace at layer {layer_id}: {row}")
+        layers.append(
+            {
+                "layer_id": layer_id,
+                "decoder_send_us": (decoder[1] - decoder[0]) / A3_CYCLES_PER_US,
+                "decoder_remote_wait_us": (decoder[2] - decoder[1]) / A3_CYCLES_PER_US,
+                "decoder_response_copy_us": (decoder[3] - decoder[2]) / A3_CYCLES_PER_US,
+                "decoder_exchange_us": (decoder[3] - decoder[0]) / A3_CYCLES_PER_US,
+                "service_wait_decoder_us": (service[1] - service[0]) / A3_CYCLES_PER_US,
+                "service_request_copy_us": (service[2] - service[1]) / A3_CYCLES_PER_US,
+                "service_compute_pack_us": (service[3] - service[2]) / A3_CYCLES_PER_US,
+                "service_response_copy_us": (service[4] - service[3]) / A3_CYCLES_PER_US,
+                "service_decoder_ack_us": (service[5] - service[4]) / A3_CYCLES_PER_US,
+            }
+        )
+    return {"event": "device_breakdown", "step": step, "layers": layers}
+
+
 def serve(args: argparse.Namespace) -> None:
     if args.pid_file:
         pid_file = Path(args.pid_file)
@@ -90,6 +118,7 @@ def serve(args: argparse.Namespace) -> None:
     requests: dict[int, PackedTensors] = {}
     responses: dict[int, torch.Tensor] = {}
     graphs: dict[int, list[torch.npu.NPUGraph]] = {}
+    trace = torch.empty((args.layers, 12), dtype=torch.int64, device="npu")
     for batch in args.batches:
         request = PackedTensors(empty_request(args, batch))
         tensors = request.views()
@@ -99,7 +128,10 @@ def serve(args: argparse.Namespace) -> None:
         for layer_id, (key_cache, scale_cache) in enumerate(caches):
             graph = torch.npu.NPUGraph()
             with torch.inference_mode(), torch.npu.graph(graph):
-                transport.service_receive(request.buffer)
+                if args.profile_device_breakdown:
+                    transport.service_receive_profiled(request.buffer, trace, layer_id)
+                else:
+                    transport.service_receive(request.buffer)
                 torch_npu.npu_scatter_nd_update_(
                     key_cache.view(-1, args.head_dim),
                     tensors["slot_mapping"].view(-1, 1),
@@ -127,7 +159,10 @@ def serve(args: argparse.Namespace) -> None:
                     sparse_mode=3,
                 )
                 response[:response_bytes].copy_(topk.view(torch.uint8).flatten())
-                transport.service_respond(response)
+                if args.profile_device_breakdown:
+                    transport.service_respond_profiled(response, trace, layer_id)
+                else:
+                    transport.service_respond(response)
             batch_graphs.append(graph)
             if layer_id in (0, args.layers - 1):
                 print(
@@ -233,6 +268,8 @@ def serve(args: argparse.Namespace) -> None:
             graph.replay()
         torch.npu.synchronize()
         token_step += 1
+        if args.profile_device_breakdown and args.profile_log_every > 0 and token_step % args.profile_log_every == 0:
+            print(json.dumps(device_breakdown(trace, token_step)), flush=True)
         if token_step % args.log_every == 0:
             print(
                 json.dumps({"event": "token_step", "step": token_step}),
@@ -249,7 +286,7 @@ def main() -> None:
     parser.add_argument("--device", type=int, default=0)
     parser.add_argument("--layers", type=int, default=61)
     parser.add_argument("--batches", type=int, nargs="+", default=[32, 16, 8])
-    parser.add_argument("--prelude-batches", type=int, nargs="+", default=[32, 16])
+    parser.add_argument("--prelude-batches", type=int, nargs="*", default=[32, 16])
     parser.add_argument("--heads", type=int, default=64)
     parser.add_argument("--head-dim", type=int, default=128)
     parser.add_argument("--topk", type=int, default=2048)
@@ -261,6 +298,8 @@ def main() -> None:
     parser.add_argument("--max-token-steps", type=int, default=0)
     parser.add_argument("--log-every", type=int, default=16)
     parser.add_argument("--debug-first-token-metadata", action="store_true")
+    parser.add_argument("--profile-device-breakdown", action="store_true")
+    parser.add_argument("--profile-log-every", type=int, default=0)
     parser.add_argument("--pid-file")
     args = parser.parse_args()
     if len(set(args.batches)) != len(args.batches):
