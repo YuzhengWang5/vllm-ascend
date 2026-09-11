@@ -179,6 +179,20 @@ class IndexerShmTransport:
             self.service_rank,
         )
 
+    def decoder_exchange_tensors(
+        self,
+        requests: list[torch.Tensor],
+        response: torch.Tensor,
+    ) -> None:
+        self._extension.decoder_exchange_tensors_profiled(
+            requests,
+            response,
+            self.gva,
+            self.symmetric_size,
+            self.decoder_rank,
+            self.service_rank,
+        )
+
     def service_receive(self, request: torch.Tensor) -> None:
         self._extension.service_receive(request, self.gva, self.symmetric_size, self.service_rank)
 
@@ -234,10 +248,12 @@ class ShmRemoteIndexerClient:
         device: int,
         topk: int,
         profile_device: bool = False,
+        direct_pack: bool = False,
     ) -> None:
         self.rank = rank
         self.topk = topk
         self.profile_device = profile_device
+        self.direct_pack = direct_pack
         self._transport = IndexerShmTransport(
             store_url=store_url,
             world_size=decoder_world_size * 2,
@@ -289,20 +305,24 @@ class ShmRemoteIndexerClient:
             "actual_seq_lengths_key": actual_seq_lengths_key,
             "block_table": block_table,
         }
-        signature = self._signature(tensors)
-        packed = self._packed.get(signature)
-        if packed is None:
-            packed = PackedTensors(tensors)
-            self._packed[signature] = packed
-        request = packed.pack(tensors)
-
         tokens = q.shape[0]
         response_bytes = tokens * self.topk * 4
         response = self._responses.get(tokens)
         if response is None:
             response = torch.empty(align32(response_bytes), dtype=torch.uint8, device=q.device)
             self._responses[tokens] = response
-        self._transport.decoder_exchange(request, response, profiled=self.profile_device)
+        if self.direct_pack:
+            self._transport.decoder_exchange_tensors(list(tensors.values()), response)
+        else:
+            signature = self._signature(tensors)
+            packed = self._packed.get(signature)
+            if packed is None:
+                packed = PackedTensors(tensors)
+                self._packed[signature] = packed
+            request = packed.pack(tensors)
+            self._transport.decoder_exchange(
+                request, response, profiled=self.profile_device
+            )
         return response[:response_bytes].view(torch.int32).view(tokens, 1, self.topk)
 
     def set_graph_callback_enqueuer(self, enqueuer: object) -> None:

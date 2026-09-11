@@ -347,6 +347,9 @@ class SparseKVOffloadManager:
                     profile_device=(
                         sparse_kv_offload_config.remote_indexer_profile_device
                     ),
+                    direct_pack=(
+                        sparse_kv_offload_config.remote_indexer_direct_pack
+                    ),
                 )
             else:
                 from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.remote_indexer import (

@@ -1062,6 +1062,9 @@ class SparseKVOffloadConfig:
         self.remote_indexer_profile_device = bool(
             user_config.get("remote_indexer_profile_device", False)
         )
+        self.remote_indexer_direct_pack = bool(
+            user_config.get("remote_indexer_direct_pack", False)
+        )
         self.remote_indexer_enabled = bool(self.remote_indexer_host)
         supported_motivation_baselines = {
             "colocated",
@@ -1102,6 +1105,10 @@ class SparseKVOffloadConfig:
         if self.remote_indexer_profile_device and self.remote_indexer_transport != "shm":
             raise ValueError(
                 "remote_indexer_profile_device is only supported by SHM transport"
+            )
+        if self.remote_indexer_direct_pack and self.remote_indexer_transport != "shm":
+            raise ValueError(
+                "remote_indexer_direct_pack is only supported by SHM transport"
             )
         if self.remote_indexer_enabled and self.motivation_baseline != "colocated":
             raise ValueError(

@@ -275,6 +275,57 @@ indexer_shm_decoder_exchange_profiled(
 }
 
 [[bisheng::core_ratio(0, 1)]] __global__ __aicore__ void
+indexer_shm_decoder_exchange_tensors_profiled(
+    GM_ADDR gva_addr, uint64_t symmetric_size, uint32_t decoder_rank,
+    uint32_t service_rank, GM_ADDR response_addr, uint32_t response_bytes,
+    GM_ADDR src0_addr, uint32_t bytes0, GM_ADDR src1_addr, uint32_t bytes1,
+    GM_ADDR src2_addr, uint32_t bytes2, GM_ADDR src3_addr, uint32_t bytes3,
+    GM_ADDR src4_addr, uint32_t bytes4, GM_ADDR src5_addr, uint32_t bytes5,
+    GM_ADDR src6_addr, uint32_t bytes6, GM_ADDR src7_addr, uint32_t bytes7,
+    GM_ADDR src8_addr, uint32_t bytes8) {
+  symmetric_size = smem_shm_get_symmetric_size();
+  auto gva = reinterpret_cast<__gm__ uint8_t*>(gva_addr);
+  auto response = reinterpret_cast<__gm__ uint8_t*>(response_addr);
+  auto decoder_base = RankBase(gva, symmetric_size, decoder_rank);
+  auto service_base = RankBase(gva, symmetric_size, service_rank);
+  auto decoder_doorbell =
+      reinterpret_cast<__gm__ uint32_t*>(decoder_base + kRequestDoorbellOffset);
+  auto service_doorbell =
+      reinterpret_cast<__gm__ uint32_t*>(service_base + kRequestDoorbellOffset);
+  auto service_ack =
+      reinterpret_cast<__gm__ uint32_t*>(service_base + kProfileOffset);
+  const uint32_t sequence = ReadSequence(decoder_doorbell) + 1U;
+  const uint32_t slot = sequence & 1U;
+  auto remote_request = PayloadSlot(service_base, slot);
+  uint32_t offset = 0;
+  const uint64_t start = ReadCycle();
+#define COPY_SOURCE(index)                                                \
+  CopyGmToGm(remote_request + offset,                                     \
+             reinterpret_cast<__gm__ uint8_t*>(src##index##_addr),        \
+             bytes##index);                                               \
+  offset += Align32(bytes##index)
+  COPY_SOURCE(0);
+  COPY_SOURCE(1);
+  COPY_SOURCE(2);
+  COPY_SOURCE(3);
+  COPY_SOURCE(4);
+  COPY_SOURCE(5);
+  COPY_SOURCE(6);
+  COPY_SOURCE(7);
+  COPY_SOURCE(8);
+#undef COPY_SOURCE
+  WriteSequence(service_doorbell, sequence);
+  const uint64_t request_sent = ReadCycle();
+  WaitSequence(decoder_doorbell, sequence);
+  const uint64_t response_ready = ReadCycle();
+  CopyGmToGm(response, PayloadSlot(decoder_base, slot), response_bytes);
+  const uint64_t response_copied = ReadCycle();
+  WriteDecoderTrace(decoder_base, start, request_sent, response_ready,
+                    response_copied);
+  WriteSequence(service_ack, sequence);
+}
+
+[[bisheng::core_ratio(0, 1)]] __global__ __aicore__ void
 indexer_shm_service_receive_profiled(
     GM_ADDR gva_addr, uint64_t symmetric_size, uint32_t service_rank,
     GM_ADDR request_addr, uint32_t request_bytes, GM_ADDR trace_addr,
@@ -366,6 +417,20 @@ extern "C" void indexer_shm_decoder_exchange_profiled_do(
   indexer_shm_decoder_exchange_profiled<<<1, nullptr, stream>>>(
       gva, symmetric_size, decoder_rank, service_rank, request, request_bytes,
       response, response_bytes);
+}
+
+extern "C" void indexer_shm_decoder_exchange_tensors_profiled_do(
+    void* stream, uint8_t* gva, uint64_t symmetric_size, uint32_t decoder_rank,
+    uint32_t service_rank, uint8_t* response, uint32_t response_bytes,
+    uint8_t* src0, uint32_t bytes0, uint8_t* src1, uint32_t bytes1,
+    uint8_t* src2, uint32_t bytes2, uint8_t* src3, uint32_t bytes3,
+    uint8_t* src4, uint32_t bytes4, uint8_t* src5, uint32_t bytes5,
+    uint8_t* src6, uint32_t bytes6, uint8_t* src7, uint32_t bytes7,
+    uint8_t* src8, uint32_t bytes8) {
+  indexer_shm_decoder_exchange_tensors_profiled<<<1, nullptr, stream>>>(
+      gva, symmetric_size, decoder_rank, service_rank, response,
+      response_bytes, src0, bytes0, src1, bytes1, src2, bytes2, src3, bytes3,
+      src4, bytes4, src5, bytes5, src6, bytes6, src7, bytes7, src8, bytes8);
 }
 
 extern "C" void indexer_shm_service_receive_profiled_do(
