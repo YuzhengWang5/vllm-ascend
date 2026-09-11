@@ -58,6 +58,43 @@ __aicore__ inline void CopyGmToGm(__gm__ uint8_t* dst,
   AscendC::WaitFlag<AscendC::HardEvent::MTE3_S>(kCopyEvent);
 }
 
+__aicore__ inline void CopyGmToGmChained(__gm__ uint8_t* dst,
+                                         __gm__ uint8_t* src,
+                                         uint32_t logical_bytes,
+                                         bool first_segment,
+                                         bool last_segment) {
+  if (logical_bytes == 0) {
+    return;
+  }
+  const uint32_t bytes = Align32(logical_bytes);
+  auto ub = PayloadUb();
+  uint32_t offset = 0;
+  if (first_segment) {
+    AscendC::SetFlag<AscendC::HardEvent::S_MTE2>(kCopyEvent);
+    AscendC::WaitFlag<AscendC::HardEvent::S_MTE2>(kCopyEvent);
+  } else {
+    AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(kCopyEvent);
+    AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(kCopyEvent);
+  }
+  while (offset < bytes) {
+    const uint32_t remain = bytes - offset;
+    const uint32_t chunk = remain > kUbPayloadBytes ? kUbPayloadBytes : remain;
+    smem_shm_copy_gm2ub(ub, src + offset, chunk);
+    AscendC::SetFlag<AscendC::HardEvent::MTE2_MTE3>(kCopyEvent);
+    AscendC::WaitFlag<AscendC::HardEvent::MTE2_MTE3>(kCopyEvent);
+    smem_shm_copy_ub2gm(dst + offset, ub, chunk);
+    offset += chunk;
+    if (offset < bytes) {
+      AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(kCopyEvent);
+      AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(kCopyEvent);
+    }
+  }
+  if (last_segment) {
+    AscendC::SetFlag<AscendC::HardEvent::MTE3_S>(kCopyEvent);
+    AscendC::WaitFlag<AscendC::HardEvent::MTE3_S>(kCopyEvent);
+  }
+}
+
 __aicore__ inline uint32_t ReadSequence(__gm__ uint32_t* doorbell) {
   auto ub = ControlUb();
   AscendC::SetFlag<AscendC::HardEvent::S_MTE2>(kCopyEvent);
@@ -299,20 +336,20 @@ indexer_shm_decoder_exchange_tensors_profiled(
   auto remote_request = PayloadSlot(service_base, slot);
   uint32_t offset = 0;
   const uint64_t start = ReadCycle();
-#define COPY_SOURCE(index)                                                \
-  CopyGmToGm(remote_request + offset,                                     \
-             reinterpret_cast<__gm__ uint8_t*>(src##index##_addr),        \
-             bytes##index);                                               \
+#define COPY_SOURCE(index, first, last)                                  \
+  CopyGmToGmChained(remote_request + offset,                              \
+                    reinterpret_cast<__gm__ uint8_t*>(src##index##_addr), \
+                    bytes##index, first, last);                           \
   offset += Align32(bytes##index)
-  COPY_SOURCE(0);
-  COPY_SOURCE(1);
-  COPY_SOURCE(2);
-  COPY_SOURCE(3);
-  COPY_SOURCE(4);
-  COPY_SOURCE(5);
-  COPY_SOURCE(6);
-  COPY_SOURCE(7);
-  COPY_SOURCE(8);
+  COPY_SOURCE(0, true, false);
+  COPY_SOURCE(1, false, false);
+  COPY_SOURCE(2, false, false);
+  COPY_SOURCE(3, false, false);
+  COPY_SOURCE(4, false, false);
+  COPY_SOURCE(5, false, false);
+  COPY_SOURCE(6, false, false);
+  COPY_SOURCE(7, false, false);
+  COPY_SOURCE(8, false, true);
 #undef COPY_SOURCE
   WriteSequence(service_doorbell, sequence);
   const uint64_t request_sent = ReadCycle();
