@@ -116,15 +116,14 @@ def serve(args: argparse.Namespace) -> None:
     torch.npu.synchronize()
 
     requests: dict[int, PackedTensors] = {}
-    responses: dict[int, torch.Tensor] = {}
+    response_sources: dict[int, list[torch.Tensor]] = {}
     graphs: dict[int, list[torch.npu.NPUGraph]] = {}
     trace = torch.empty((args.layers, 12), dtype=torch.int64, device="npu")
     for batch in args.batches:
         request = PackedTensors(empty_request(args, batch))
         tensors = request.views()
-        response_bytes = batch * args.topk * 4
-        response = torch.empty(align32(response_bytes), dtype=torch.uint8, device="npu")
         batch_graphs: list[torch.npu.NPUGraph] = []
+        batch_response_sources: list[torch.Tensor] = []
         for layer_id, (key_cache, scale_cache) in enumerate(caches):
             graph = torch.npu.NPUGraph()
             with torch.inference_mode(), torch.npu.graph(graph):
@@ -158,12 +157,17 @@ def serve(args: argparse.Namespace) -> None:
                     sparse_count=args.topk,
                     sparse_mode=3,
                 )
-                response[:response_bytes].copy_(topk.view(torch.uint8).flatten())
+                response_source = topk.view(torch.uint8).flatten()
                 if args.profile_device_breakdown:
-                    transport.service_respond_profiled(response, trace, layer_id)
+                    transport.service_respond_profiled(
+                        response_source, trace, layer_id
+                    )
                 else:
-                    transport.service_respond(response)
+                    transport.service_respond(response_source)
             batch_graphs.append(graph)
+            # Keep the graph output allocation alive: the captured transport
+            # kernel reuses this exact address on every replay.
+            batch_response_sources.append(topk)
             if layer_id in (0, args.layers - 1):
                 print(
                     json.dumps(
@@ -176,7 +180,7 @@ def serve(args: argparse.Namespace) -> None:
                     flush=True,
                 )
         requests[batch] = request
-        responses[batch] = response
+        response_sources[batch] = batch_response_sources
         graphs[batch] = batch_graphs
 
     print(
@@ -188,7 +192,10 @@ def serve(args: argparse.Namespace) -> None:
                 "layers": args.layers,
                 "batches": args.batches,
                 "request_bytes": {batch: requests[batch].buffer.numel() for batch in args.batches},
-                "response_bytes": {batch: responses[batch].numel() for batch in args.batches},
+                "response_bytes": {
+                    batch: align32(batch * args.topk * 4)
+                    for batch in args.batches
+                },
             }
         ),
         flush=True,
@@ -209,8 +216,6 @@ def serve(args: argparse.Namespace) -> None:
     if args.debug_first_token_metadata:
         request = requests[steady_batch]
         tensors = request.views()
-        response = responses[steady_batch]
-        response_bytes = steady_batch * args.topk * 4
         for layer_id, (key_cache, scale_cache) in enumerate(caches):
             transport.service_receive(request.buffer)
             torch.npu.synchronize()
@@ -255,8 +260,7 @@ def serve(args: argparse.Namespace) -> None:
                 sparse_count=args.topk,
                 sparse_mode=3,
             )
-            response[:response_bytes].copy_(topk.view(torch.uint8).flatten())
-            transport.service_respond(response)
+            transport.service_respond(topk.view(torch.uint8).flatten())
             torch.npu.synchronize()
         token_step = 1
         print(json.dumps({"event": "debug_first_token_done"}), flush=True)
