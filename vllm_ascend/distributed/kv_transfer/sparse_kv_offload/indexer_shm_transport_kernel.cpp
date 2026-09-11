@@ -58,43 +58,6 @@ __aicore__ inline void CopyGmToGm(__gm__ uint8_t* dst,
   AscendC::WaitFlag<AscendC::HardEvent::MTE3_S>(kCopyEvent);
 }
 
-__aicore__ inline void CopyGmToGmChained(__gm__ uint8_t* dst,
-                                         __gm__ uint8_t* src,
-                                         uint32_t logical_bytes,
-                                         bool first_segment,
-                                         bool last_segment) {
-  if (logical_bytes == 0) {
-    return;
-  }
-  const uint32_t bytes = Align32(logical_bytes);
-  auto ub = PayloadUb();
-  uint32_t offset = 0;
-  if (first_segment) {
-    AscendC::SetFlag<AscendC::HardEvent::S_MTE2>(kCopyEvent);
-    AscendC::WaitFlag<AscendC::HardEvent::S_MTE2>(kCopyEvent);
-  } else {
-    AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(kCopyEvent);
-    AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(kCopyEvent);
-  }
-  while (offset < bytes) {
-    const uint32_t remain = bytes - offset;
-    const uint32_t chunk = remain > kUbPayloadBytes ? kUbPayloadBytes : remain;
-    smem_shm_copy_gm2ub(ub, src + offset, chunk);
-    AscendC::SetFlag<AscendC::HardEvent::MTE2_MTE3>(kCopyEvent);
-    AscendC::WaitFlag<AscendC::HardEvent::MTE2_MTE3>(kCopyEvent);
-    smem_shm_copy_ub2gm(dst + offset, ub, chunk);
-    offset += chunk;
-    if (offset < bytes) {
-      AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(kCopyEvent);
-      AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(kCopyEvent);
-    }
-  }
-  if (last_segment) {
-    AscendC::SetFlag<AscendC::HardEvent::MTE3_S>(kCopyEvent);
-    AscendC::WaitFlag<AscendC::HardEvent::MTE3_S>(kCopyEvent);
-  }
-}
-
 __aicore__ inline uint32_t ReadSequence(__gm__ uint32_t* doorbell) {
   auto ub = ControlUb();
   AscendC::SetFlag<AscendC::HardEvent::S_MTE2>(kCopyEvent);
@@ -331,26 +294,52 @@ indexer_shm_decoder_exchange_tensors_profiled(
       reinterpret_cast<__gm__ uint32_t*>(service_base + kRequestDoorbellOffset);
   auto service_ack =
       reinterpret_cast<__gm__ uint32_t*>(service_base + kProfileOffset);
+  const uint32_t core_id = AscendC::GetBlockIdx();
   const uint32_t sequence = ReadSequence(decoder_doorbell) + 1U;
   const uint32_t slot = sequence & 1U;
   auto remote_request = PayloadSlot(service_base, slot);
-  uint32_t offset = 0;
-  const uint64_t start = ReadCycle();
-#define COPY_SOURCE(index, first, last)                                  \
-  CopyGmToGmChained(remote_request + offset,                              \
-                    reinterpret_cast<__gm__ uint8_t*>(src##index##_addr), \
-                    bytes##index, first, last);                           \
-  offset += Align32(bytes##index)
-  COPY_SOURCE(0, true, false);
-  COPY_SOURCE(1, false, false);
-  COPY_SOURCE(2, false, false);
-  COPY_SOURCE(3, false, false);
-  COPY_SOURCE(4, false, false);
-  COPY_SOURCE(5, false, false);
-  COPY_SOURCE(6, false, false);
-  COPY_SOURCE(7, false, false);
-  COPY_SOURCE(8, false, true);
+  const uint32_t offset1 = Align32(bytes0);
+  const uint32_t offset2 = offset1 + Align32(bytes1);
+  const uint32_t offset3 = offset2 + Align32(bytes2);
+  const uint32_t offset4 = offset3 + Align32(bytes3);
+  const uint32_t offset5 = offset4 + Align32(bytes4);
+  const uint32_t offset6 = offset5 + Align32(bytes5);
+  const uint32_t offset7 = offset6 + Align32(bytes6);
+  const uint32_t offset8 = offset7 + Align32(bytes7);
+  uint64_t start = 0;
+  AscendC::SyncAll<true>();
+  if (core_id == 0U) {
+    start = ReadCycle();
+  }
+  AscendC::SyncAll<true>();
+#define COPY_SOURCE(index, offset)                                      \
+  CopyGmToGm(remote_request + offset,                                   \
+             reinterpret_cast<__gm__ uint8_t*>(src##index##_addr),      \
+             bytes##index)
+  if (core_id == 0U) {
+    COPY_SOURCE(0, 0U);
+  } else if (core_id == 1U) {
+    COPY_SOURCE(1, offset1);
+  } else if (core_id == 2U) {
+    COPY_SOURCE(2, offset2);
+  } else if (core_id == 3U) {
+    COPY_SOURCE(3, offset3);
+  } else if (core_id == 4U) {
+    COPY_SOURCE(4, offset4);
+  } else if (core_id == 5U) {
+    COPY_SOURCE(5, offset5);
+  } else if (core_id == 6U) {
+    COPY_SOURCE(6, offset6);
+  } else if (core_id == 7U) {
+    COPY_SOURCE(7, offset7);
+  } else {
+    COPY_SOURCE(8, offset8);
+  }
 #undef COPY_SOURCE
+  AscendC::SyncAll<true>();
+  if (core_id != 0U) {
+    return;
+  }
   WriteSequence(service_doorbell, sequence);
   const uint64_t request_sent = ReadCycle();
   WaitSequence(decoder_doorbell, sequence);
@@ -464,7 +453,7 @@ extern "C" void indexer_shm_decoder_exchange_tensors_profiled_do(
     uint8_t* src4, uint32_t bytes4, uint8_t* src5, uint32_t bytes5,
     uint8_t* src6, uint32_t bytes6, uint8_t* src7, uint32_t bytes7,
     uint8_t* src8, uint32_t bytes8) {
-  indexer_shm_decoder_exchange_tensors_profiled<<<1, nullptr, stream>>>(
+  indexer_shm_decoder_exchange_tensors_profiled<<<9, nullptr, stream>>>(
       gva, symmetric_size, decoder_rank, service_rank, response,
       response_bytes, src0, bytes0, src1, bytes1, src2, bytes2, src3, bytes3,
       src4, bytes4, src5, bytes5, src6, bytes6, src7, bytes7, src8, bytes8);
