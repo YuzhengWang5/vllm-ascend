@@ -8,9 +8,13 @@ select path uses a fixed-schema header followed by contiguous tensor bytes.
 from __future__ import annotations
 
 import io
+import json
+import os
+import signal
 import socket
 import struct
 import threading
+import time
 from collections.abc import Callable
 from typing import Any
 
@@ -29,6 +33,13 @@ _SELECT_RESPONSE_HEADER = struct.Struct("!BQ")
 _SELECT_OK = 1
 _SELECT_ERROR = 0
 _GRAPH_CLIENTS: dict[int, "RemoteIndexerClient"] = {}
+
+
+def _breakdown_enabled(rank: int) -> bool:
+    configured = os.environ.get("IAAS_BREAKDOWN_RANKS", "")
+    return str(rank) in {
+        item.strip() for item in configured.split(",") if item.strip()
+    }
 
 
 def _run_graph_callback(rank: int, layer_id: int) -> None:
@@ -274,10 +285,23 @@ class RemoteIndexerClient:
         self._buffers: dict[tuple[str, tuple[int, ...], torch.dtype], torch.Tensor] = {}
         self._lock = threading.Lock()
         self._request_id = 0
+        self._breakdown_enabled = _breakdown_enabled(rank)
         self._enqueue_graph_callback = None
         self._graph_staged: dict[str, torch.Tensor] | None = None
         self._graph_output_cpu: torch.Tensor | None = None
         _GRAPH_CLIENTS[self.rank] = self
+        if self.rank == 0 and threading.current_thread() is threading.main_thread():
+            # Allow a clean macro run followed by an instrumented window in the
+            # same expensive model process.  USR1 enables and USR2 disables
+            # rank-0 per-call logging.
+            signal.signal(signal.SIGUSR1, self._enable_breakdown)
+            signal.signal(signal.SIGUSR2, self._disable_breakdown)
+
+    def _enable_breakdown(self, _signum: int, _frame: Any) -> None:
+        self._breakdown_enabled = True
+
+    def _disable_breakdown(self, _signum: int, _frame: Any) -> None:
+        self._breakdown_enabled = False
 
     def set_graph_callback_enqueuer(self, enqueuer: Any) -> None:
         self._enqueue_graph_callback = enqueuer
@@ -447,8 +471,41 @@ class RemoteIndexerClient:
     def _select_host(self, args: tuple[int, dict[str, torch.Tensor], torch.Tensor]) -> None:
         layer_id, staged, output_cpu = args
         with self._lock:
+            if self._breakdown_enabled:
+                rpc_started_at = time.perf_counter_ns()
             sock = self._connect()
+            if self._breakdown_enabled:
+                connected_at = time.perf_counter_ns()
             request_id = self._request_id
             self._request_id += 1
             send_raw_select_request(sock, request_id, layer_id, staged)
+            if self._breakdown_enabled:
+                sent_at = time.perf_counter_ns()
             recv_raw_select_response(sock, request_id, output_cpu)
+            if self._breakdown_enabled:
+                received_at = time.perf_counter_ns()
+                request_bytes = 1 + _SELECT_HEADER.size + sum(
+                    tensor.numel() * tensor.element_size()
+                    for tensor in staged.values()
+                )
+                response_bytes = (
+                    _SELECT_RESPONSE_HEADER.size
+                    + output_cpu.numel() * output_cpu.element_size()
+                )
+                print(
+                    json.dumps(
+                        {
+                            "event": "remote_indexer_client_breakdown",
+                            "rank": self.rank,
+                            "request_id": request_id,
+                            "layer_id": layer_id,
+                            "request_bytes": request_bytes,
+                            "response_bytes": response_bytes,
+                            "connect_ms": (connected_at - rpc_started_at) / 1e6,
+                            "send_ms": (sent_at - connected_at) / 1e6,
+                            "recv_wait_ms": (received_at - sent_at) / 1e6,
+                            "rpc_ms": (received_at - rpc_started_at) / 1e6,
+                        }
+                    ),
+                    flush=True,
+                )

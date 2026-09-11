@@ -58,6 +58,13 @@ class RemoteIndexerWorker:
         self._profile_active = False
         self._profile_start_requested = False
         self._profile_stop_requested = False
+        configured_breakdown_ranks = {
+            item.strip()
+            for item in os.environ.get("IAAS_BREAKDOWN_RANKS", "").split(",")
+            if item.strip()
+        }
+        self.breakdown_enabled = str(rank) in configured_breakdown_ranks
+        self.last_breakdown: dict[str, float] = {}
         torch.npu.set_device(device)
 
         if self.profile_dir:
@@ -65,6 +72,17 @@ class RemoteIndexerWorker:
             # at the next request boundary on the worker's main thread.
             signal.signal(signal.SIGUSR1, self._request_profile_start)
             signal.signal(signal.SIGUSR2, self._request_profile_stop)
+        elif self.rank == 0:
+            # With no torch profiler configured, reuse USR1/USR2 to bracket a
+            # lightweight per-call breakdown window after macro benchmarking.
+            signal.signal(signal.SIGUSR1, self._enable_breakdown)
+            signal.signal(signal.SIGUSR2, self._disable_breakdown)
+
+    def _enable_breakdown(self, _signum, _frame) -> None:
+        self.breakdown_enabled = True
+
+    def _disable_breakdown(self, _signum, _frame) -> None:
+        self.breakdown_enabled = False
 
     def _request_profile_start(self, _signum, _frame) -> None:
         self._profile_start_requested = True
@@ -198,6 +216,7 @@ class RemoteIndexerWorker:
         torch.npu.synchronize()
 
     def select(self, request: dict) -> torch.Tensor:
+        select_started_at = time.perf_counter_ns()
         valid_block_ids = request["block_table"][request["block_table"] >= 0]
         if valid_block_ids.numel() > 0:
             largest_block_id = int(valid_block_ids.max().item())
@@ -207,6 +226,11 @@ class RemoteIndexerWorker:
                     f"largest block id={largest_block_id}, "
                     f"cache_blocks={self.cache_blocks}"
                 )
+        validation_done_at = time.perf_counter_ns()
+        events = None
+        if self.breakdown_enabled:
+            events = [torch.npu.Event(enable_timing=True) for _ in range(5)]
+            events[0].record()
         q = request["q"].to("npu")
         q_scale = request["q_scale"].to("npu")
         weights = request["weights"].to("npu")
@@ -216,6 +240,9 @@ class RemoteIndexerWorker:
         actual_seq_lengths_query = request["actual_seq_lengths_query"].to("npu")
         actual_seq_lengths_key = request["actual_seq_lengths_key"].to("npu")
         block_table = request["block_table"].to("npu")
+        if events is not None:
+            events[1].record()
+        h2d_enqueued_at = time.perf_counter_ns()
 
         key_cache, scale_cache = self._cache(int(request["layer_id"]))
         # Match the colocated SFA path exactly.  In particular, the Ascend
@@ -232,6 +259,9 @@ class RemoteIndexerWorker:
             slot_mapping.view(-1, 1),
             new_k_scale.view(-1, 1),
         )
+        if events is not None:
+            events[2].record()
+        scatter_enqueued_at = time.perf_counter_ns()
 
         # A3's colocated custom op lowers to the same public FP16 ABI.  A
         # one-die equivalence probe is archived with this experiment.
@@ -251,7 +281,28 @@ class RemoteIndexerWorker:
             sparse_count=self.topk,
             sparse_mode=3,
         )
-        return topk.cpu()
+        if events is not None:
+            events[3].record()
+        indexer_enqueued_at = time.perf_counter_ns()
+        output = topk.cpu()
+        if events is not None:
+            events[4].record()
+            events[4].synchronize()
+        d2h_done_at = time.perf_counter_ns()
+        if events is not None:
+            self.last_breakdown = {
+                "validation_wall_ms": (validation_done_at - select_started_at) / 1e6,
+                "h2d_enqueue_wall_ms": (h2d_enqueued_at - validation_done_at) / 1e6,
+                "scatter_enqueue_wall_ms": (scatter_enqueued_at - h2d_enqueued_at) / 1e6,
+                "indexer_enqueue_wall_ms": (indexer_enqueued_at - scatter_enqueued_at) / 1e6,
+                "d2h_wait_wall_ms": (d2h_done_at - indexer_enqueued_at) / 1e6,
+                "worker_wall_ms": (d2h_done_at - select_started_at) / 1e6,
+                "h2d_device_ms": events[0].elapsed_time(events[1]),
+                "scatter_device_ms": events[1].elapsed_time(events[2]),
+                "indexer_device_ms": events[2].elapsed_time(events[3]),
+                "d2h_device_ms": events[3].elapsed_time(events[4]),
+            }
+        return output
 
 
 def serve(args: argparse.Namespace) -> None:
@@ -319,7 +370,7 @@ def serve(args: argparse.Namespace) -> None:
             while True:
                 message_kind = _recv_exact(connection, 1)
                 worker.apply_profile_control()
-                started_at = time.perf_counter()
+                started_at = time.perf_counter_ns()
                 if message_kind == SELECT_MESSAGE:
                     # Keep the fallback valid for the unsigned wire field even
                     # when header decoding itself fails.
@@ -328,13 +379,34 @@ def serve(args: argparse.Namespace) -> None:
                         request = recv_raw_select_request(
                             connection, worker.host_buffer
                         )
+                        received_at = time.perf_counter_ns()
                         request_id = int(request["request_id"])
                         topk = worker.select(request)
+                        selected_at = time.perf_counter_ns()
                         send_raw_select_response(connection, request_id, topk)
+                        sent_at = time.perf_counter_ns()
                     except Exception as error:
                         send_raw_select_error(connection, request_id, repr(error))
                         raise
-                    if request_id % args.log_every == 0:
+                    if worker.breakdown_enabled:
+                        print(
+                            json.dumps(
+                                {
+                                    "event": "remote_indexer_service_breakdown",
+                                    "rank": args.rank,
+                                    "request_id": request_id,
+                                    "layer_id": request["layer_id"],
+                                    "tokens": request["q"].shape[0],
+                                    "request_recv_ms": (received_at - started_at) / 1e6,
+                                    "worker_select_ms": (selected_at - received_at) / 1e6,
+                                    "response_send_ms": (sent_at - selected_at) / 1e6,
+                                    "service_total_ms": (sent_at - started_at) / 1e6,
+                                    **worker.last_breakdown,
+                                }
+                            ),
+                            flush=True,
+                        )
+                    elif request_id % args.log_every == 0:
                         print(
                             json.dumps(
                                 {
@@ -344,9 +416,9 @@ def serve(args: argparse.Namespace) -> None:
                                     "layer_id": request["layer_id"],
                                     "tokens": request["q"].shape[0],
                                     "elapsed_ms": (
-                                        time.perf_counter() - started_at
+                                        time.perf_counter_ns() - started_at
                                     )
-                                    * 1000,
+                                    / 1e6,
                                 }
                             ),
                             flush=True,
