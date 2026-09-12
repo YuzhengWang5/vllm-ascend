@@ -1065,6 +1065,21 @@ class SparseKVOffloadConfig:
         self.remote_indexer_direct_pack = bool(
             user_config.get("remote_indexer_direct_pack", False)
         )
+        self.remote_indexer_share_within_tp = bool(
+            user_config.get("remote_indexer_share_within_tp", False)
+        )
+        self.remote_indexer_gva_tp_fanout = bool(
+            user_config.get("remote_indexer_gva_tp_fanout", False)
+        )
+        self.remote_indexer_verify_tp_inputs = bool(
+            user_config.get("remote_indexer_verify_tp_inputs", False)
+        )
+        self.remote_indexer_init_gate_file = str(
+            user_config.get("remote_indexer_init_gate_file", "")
+        )
+        self.remote_indexer_metadata_once_per_step = bool(
+            user_config.get("remote_indexer_metadata_once_per_step", False)
+        )
         self.remote_indexer_enabled = bool(self.remote_indexer_host)
         supported_motivation_baselines = {
             "colocated",
@@ -1109,6 +1124,29 @@ class SparseKVOffloadConfig:
         if self.remote_indexer_direct_pack and self.remote_indexer_transport != "shm":
             raise ValueError(
                 "remote_indexer_direct_pack is only supported by SHM transport"
+            )
+        if self.remote_indexer_share_within_tp and self.remote_indexer_transport != "shm":
+            raise ValueError(
+                "remote_indexer_share_within_tp is only supported by SHM transport"
+            )
+        if self.remote_indexer_verify_tp_inputs and not self.remote_indexer_share_within_tp:
+            raise ValueError(
+                "remote_indexer_verify_tp_inputs requires remote_indexer_share_within_tp"
+            )
+        if self.remote_indexer_gva_tp_fanout and not self.remote_indexer_share_within_tp:
+            raise ValueError(
+                "remote_indexer_gva_tp_fanout requires remote_indexer_share_within_tp"
+            )
+        if self.remote_indexer_gva_tp_fanout and self.remote_indexer_transport != "shm":
+            raise ValueError(
+                "remote_indexer_gva_tp_fanout is only supported by SHM transport"
+            )
+        if (
+            self.remote_indexer_metadata_once_per_step
+            and self.remote_indexer_transport != "shm"
+        ):
+            raise ValueError(
+                "remote_indexer_metadata_once_per_step is only supported by SHM transport"
             )
         if self.remote_indexer_enabled and self.motivation_baseline != "colocated":
             raise ValueError(

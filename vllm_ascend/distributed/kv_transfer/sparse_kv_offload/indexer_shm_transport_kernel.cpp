@@ -6,6 +6,8 @@ namespace {
 constexpr uint64_t kRequestDoorbellOffset = 0;
 constexpr uint64_t kServiceSeenOffset = 32;
 constexpr uint64_t kProfileOffset = 64;
+constexpr uint64_t kTpFanoutDoorbellOffset = 128;
+constexpr uint64_t kTpFanoutAckOffset = 160;
 constexpr uint64_t kPayloadOffset = 4096;
 constexpr uint64_t kMaxPayloadBytes = 1UL << 20;
 constexpr uint32_t kUbPayloadBytes = 64U << 10;
@@ -181,6 +183,55 @@ indexer_shm_initialize_control(GM_ADDR gva_addr, uint64_t symmetric_size,
       reinterpret_cast<__gm__ uint32_t*>(rank_base + kServiceSeenOffset), 0U);
   WriteSequence(
       reinterpret_cast<__gm__ uint32_t*>(rank_base + kProfileOffset), 0U);
+  WriteSequence(reinterpret_cast<__gm__ uint32_t*>(
+                    rank_base + kTpFanoutDoorbellOffset),
+                0U);
+  WriteSequence(
+      reinterpret_cast<__gm__ uint32_t*>(rank_base + kTpFanoutAckOffset), 0U);
+}
+
+// Fan out one rank's response to the other ranks without launching an HCCL
+// collective.  The leader publishes into its symmetric segment and waits for
+// one acknowledgement in each follower's segment before reusing the slot.
+[[bisheng::core_ratio(0, 1)]] __global__ __aicore__ void
+indexer_shm_tp_fanout_leader(GM_ADDR gva_addr, uint64_t symmetric_size,
+                             uint32_t leader_rank, uint32_t group_size,
+                             GM_ADDR source_addr, uint32_t source_bytes) {
+  symmetric_size = smem_shm_get_symmetric_size();
+  auto gva = reinterpret_cast<__gm__ uint8_t*>(gva_addr);
+  auto source = reinterpret_cast<__gm__ uint8_t*>(source_addr);
+  auto leader_base = RankBase(gva, symmetric_size, leader_rank);
+  auto leader_doorbell =
+      reinterpret_cast<__gm__ uint32_t*>(leader_base + kTpFanoutDoorbellOffset);
+  const uint32_t sequence = ReadSequence(leader_doorbell) + 1U;
+  CopyGmToGm(PayloadSlot(leader_base, sequence & 1U), source, source_bytes);
+  WriteSequence(leader_doorbell, sequence);
+  for (uint32_t rank = leader_rank + 1U;
+       rank < leader_rank + group_size; ++rank) {
+    auto follower_base = RankBase(gva, symmetric_size, rank);
+    auto follower_ack = reinterpret_cast<__gm__ uint32_t*>(
+        follower_base + kTpFanoutAckOffset);
+    WaitSequence(follower_ack, sequence);
+  }
+}
+
+[[bisheng::core_ratio(0, 1)]] __global__ __aicore__ void
+indexer_shm_tp_fanout_follower(GM_ADDR gva_addr, uint64_t symmetric_size,
+                               uint32_t rank, uint32_t leader_rank,
+                               GM_ADDR output_addr, uint32_t output_bytes) {
+  symmetric_size = smem_shm_get_symmetric_size();
+  auto gva = reinterpret_cast<__gm__ uint8_t*>(gva_addr);
+  auto output = reinterpret_cast<__gm__ uint8_t*>(output_addr);
+  auto rank_base = RankBase(gva, symmetric_size, rank);
+  auto leader_base = RankBase(gva, symmetric_size, leader_rank);
+  auto follower_ack =
+      reinterpret_cast<__gm__ uint32_t*>(rank_base + kTpFanoutAckOffset);
+  auto leader_doorbell =
+      reinterpret_cast<__gm__ uint32_t*>(leader_base + kTpFanoutDoorbellOffset);
+  const uint32_t sequence = ReadSequence(follower_ack) + 1U;
+  WaitSequence(leader_doorbell, sequence);
+  CopyGmToGm(output, PayloadSlot(leader_base, sequence & 1U), output_bytes);
+  WriteSequence(follower_ack, sequence);
 }
 
 [[bisheng::core_ratio(0, 1)]] __global__ __aicore__ void
@@ -411,6 +462,20 @@ extern "C" void indexer_shm_initialize_control_do(
     void* stream, uint8_t* gva, uint64_t symmetric_size, uint32_t rank) {
   indexer_shm_initialize_control<<<1, nullptr, stream>>>(gva, symmetric_size,
                                                          rank);
+}
+
+extern "C" void indexer_shm_tp_fanout_leader_do(
+    void* stream, uint8_t* gva, uint64_t symmetric_size, uint32_t leader_rank,
+    uint32_t group_size, uint8_t* source, uint32_t source_bytes) {
+  indexer_shm_tp_fanout_leader<<<1, nullptr, stream>>>(
+      gva, symmetric_size, leader_rank, group_size, source, source_bytes);
+}
+
+extern "C" void indexer_shm_tp_fanout_follower_do(
+    void* stream, uint8_t* gva, uint64_t symmetric_size, uint32_t rank,
+    uint32_t leader_rank, uint8_t* output, uint32_t output_bytes) {
+  indexer_shm_tp_fanout_follower<<<1, nullptr, stream>>>(
+      gva, symmetric_size, rank, leader_rank, output, output_bytes);
 }
 
 extern "C" void indexer_shm_decoder_exchange_do(

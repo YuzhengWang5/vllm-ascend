@@ -1,5 +1,6 @@
 import contextlib
 import os
+import time
 import typing
 from zlib import adler32
 
@@ -329,28 +330,73 @@ class SparseKVOffloadManager:
         self.topk_buffer_size = sparse_kv_offload_config.topk_buffer_size
         self.topk = sparse_kv_offload_config.topk
         self.motivation_baseline = sparse_kv_offload_config.motivation_baseline
+        self.remote_indexer_share_within_tp = (
+            sparse_kv_offload_config.remote_indexer_share_within_tp
+        )
+        self.remote_indexer_gva_tp_fanout = (
+            sparse_kv_offload_config.remote_indexer_gva_tp_fanout
+        )
+        self.remote_indexer_verify_tp_inputs = (
+            sparse_kv_offload_config.remote_indexer_verify_tp_inputs
+        )
+        self._remote_indexer_tp_responses: dict[int, torch.Tensor] = {}
+        self._verified_remote_indexer_layers: set[int] = set()
+        self.remote_indexer_is_leader = True
+        self.remote_indexer_tp_leader_shm_rank: int | None = None
         self.remote_indexer_client = None
         if sparse_kv_offload_config.remote_indexer_enabled:
-            remote_rank = self.dp_rank * self.tp_size + self.tp_rank
+            if self.remote_indexer_share_within_tp:
+                remote_rank = self.dp_rank
+                decoder_world_size = parallel_config.data_parallel_size
+                self.remote_indexer_is_leader = self.tp_rank == 0
+                create_remote_client = (
+                    self.remote_indexer_is_leader
+                    or self.remote_indexer_gva_tp_fanout
+                )
+            else:
+                remote_rank = self.dp_rank * self.tp_size + self.tp_rank
+                decoder_world_size = parallel_config.data_parallel_size * self.tp_size
+                create_remote_client = True
             if sparse_kv_offload_config.remote_indexer_transport == "shm":
                 from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.indexer_shm_transport import (
                     ShmRemoteIndexerClient,
                 )
 
-                decoder_world_size = parallel_config.data_parallel_size * self.tp_size
-                self.remote_indexer_client = ShmRemoteIndexerClient(
-                    store_url=sparse_kv_offload_config.remote_indexer_shm_store,
-                    decoder_world_size=decoder_world_size,
-                    rank=remote_rank,
-                    device=torch_npu.npu.current_device(),
-                    topk=sparse_kv_offload_config.topk,
-                    profile_device=(
-                        sparse_kv_offload_config.remote_indexer_profile_device
-                    ),
-                    direct_pack=(
-                        sparse_kv_offload_config.remote_indexer_direct_pack
-                    ),
-                )
+                if create_remote_client:
+                    shm_topology: dict[str, int] = {}
+                    if self.remote_indexer_gva_tp_fanout:
+                        service_count = parallel_config.data_parallel_size
+                        shm_global_rank = (
+                            service_count
+                            + self.dp_rank * self.tp_size
+                            + self.tp_rank
+                        )
+                        self.remote_indexer_tp_leader_shm_rank = (
+                            service_count + self.dp_rank * self.tp_size
+                        )
+                        shm_topology = {
+                            "shm_world_size": service_count * (self.tp_size + 1),
+                            "shm_global_rank": shm_global_rank,
+                            "shm_decoder_rank": self.remote_indexer_tp_leader_shm_rank,
+                            "shm_service_rank": self.dp_rank,
+                        }
+                    self.remote_indexer_client = ShmRemoteIndexerClient(
+                        store_url=sparse_kv_offload_config.remote_indexer_shm_store,
+                        decoder_world_size=decoder_world_size,
+                        rank=remote_rank,
+                        device=torch_npu.npu.current_device(),
+                        topk=sparse_kv_offload_config.topk,
+                        profile_device=(
+                            sparse_kv_offload_config.remote_indexer_profile_device
+                        ),
+                        direct_pack=(
+                            sparse_kv_offload_config.remote_indexer_direct_pack
+                        ),
+                        metadata_once_per_step=(
+                            sparse_kv_offload_config.remote_indexer_metadata_once_per_step
+                        ),
+                        **shm_topology,
+                    )
             else:
                 from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.remote_indexer import (
                     RemoteIndexerClient,
@@ -407,6 +453,22 @@ class SparseKVOffloadManager:
             self.remote_indexer_client.set_graph_callback_enqueuer(
                 self.sparse_kv_offload_cpp.enqueue_remote_indexer_subscribed_callback
             )
+
+        init_gate_file = sparse_kv_offload_config.remote_indexer_init_gate_file
+        if init_gate_file:
+            logger.warning(
+                "Sparse KV offload waits for host-memory init gate: %s",
+                init_gate_file,
+            )
+            deadline = time.monotonic() + 1200
+            while not os.path.exists(init_gate_file):
+                if time.monotonic() >= deadline:
+                    raise TimeoutError(
+                        "Timed out waiting for Sparse KV offload init gate: "
+                        f"{init_gate_file}"
+                    )
+                time.sleep(0.5)
+            logger.info("Sparse KV offload host-memory init gate opened")
 
         logger.info(
             "SparseKVOffloadManager start init CPU KV pool with %s "
@@ -843,26 +905,99 @@ class SparseKVOffloadManager:
         block_table: torch.Tensor,
         capturing: bool,
     ) -> torch.Tensor:
-        if self.remote_indexer_client is None:
+        if self.remote_indexer_client is None and not self.remote_indexer_share_within_tp:
             raise RuntimeError("Remote indexer client is not configured")
+        layer_id = self._get_offload_layer_id(layer_name)
+        if (
+            self.remote_indexer_verify_tp_inputs
+            and not capturing
+            and layer_id in {0, self.num_layers // 2, self.num_layers - 1}
+            and layer_id not in self._verified_remote_indexer_layers
+        ):
+            self._verify_remote_indexer_tp_inputs(
+                layer_id,
+                {
+                    "q": q,
+                    "q_scale": q_scale,
+                    "weights": weights,
+                    "new_k": new_k,
+                    "new_k_scale": new_k_scale,
+                    "slot_mapping": slot_mapping,
+                    "actual_seq_lengths_query": actual_seq_lengths_query,
+                    "actual_seq_lengths_key": actual_seq_lengths_key,
+                    "block_table": block_table,
+                },
+            )
         if capturing:
             current_compute_stream = torch_npu.npu.current_stream()
             subscribed_compute_streams = get_subscribed_compute_streams()
             if current_compute_stream not in subscribed_compute_streams:
                 torch_npu.npu._subscribe_report(current_compute_stream)
                 subscribed_compute_streams.add(current_compute_stream)
-        return self.remote_indexer_client.select(
-            layer_id=self._get_offload_layer_id(layer_name),
-            q=q,
-            q_scale=q_scale,
-            weights=weights,
-            new_k=new_k,
-            new_k_scale=new_k_scale,
-            slot_mapping=slot_mapping,
-            actual_seq_lengths_query=actual_seq_lengths_query,
-            actual_seq_lengths_key=actual_seq_lengths_key,
-            block_table=block_table,
-            capturing=capturing,
+        if self.remote_indexer_is_leader:
+            if self.remote_indexer_client is None:
+                raise RuntimeError("Remote indexer leader client is not configured")
+            topk = self.remote_indexer_client.select(
+                layer_id=layer_id,
+                q=q,
+                q_scale=q_scale,
+                weights=weights,
+                new_k=new_k,
+                new_k_scale=new_k_scale,
+                slot_mapping=slot_mapping,
+                actual_seq_lengths_query=actual_seq_lengths_query,
+                actual_seq_lengths_key=actual_seq_lengths_key,
+                block_table=block_table,
+                capturing=capturing,
+            )
+        else:
+            tokens = q.shape[0]
+            topk = self._remote_indexer_tp_responses.get(tokens)
+            if topk is None:
+                topk = torch.empty(
+                    (tokens, 1, self.topk),
+                    dtype=torch.int32,
+                    device=q.device,
+                )
+                self._remote_indexer_tp_responses[tokens] = topk
+        if self.remote_indexer_share_within_tp and self.tp_size > 1:
+            if self.remote_indexer_gva_tp_fanout:
+                if self.remote_indexer_client is None:
+                    raise RuntimeError("GVA TP fanout client is not configured")
+                if self.remote_indexer_tp_leader_shm_rank is None:
+                    raise RuntimeError("GVA TP leader rank is not configured")
+                self.remote_indexer_client.tp_fanout(
+                    topk,
+                    leader_rank=self.remote_indexer_tp_leader_shm_rank,
+                    group_size=self.tp_size,
+                )
+            else:
+                self.tp_group.broadcast(topk, src=0)
+        return topk
+
+    def _verify_remote_indexer_tp_inputs(
+        self,
+        layer_id: int,
+        tensors: dict[str, torch.Tensor],
+    ) -> None:
+        """Debug-only exact equality gate before enabling TP-shared indexing."""
+        mismatch = torch.zeros((), dtype=torch.int64, device=next(iter(tensors.values())).device)
+        for tensor in tensors.values():
+            reference = tensor.clone()
+            self.tp_group.broadcast(reference, src=0)
+            mismatch.add_(torch.count_nonzero(tensor != reference))
+        mismatch = self.tp_group.all_reduce(mismatch)
+        mismatch_count = int(mismatch.cpu().item())
+        if mismatch_count:
+            raise RuntimeError(
+                "Remote indexer TP sharing requires identical inputs, "
+                f"but layer {layer_id} has {mismatch_count} mismatched elements"
+            )
+        self._verified_remote_indexer_layers.add(layer_id)
+        logger.info(
+            "Remote indexer TP input equality passed for layer %d across %d ranks",
+            layer_id,
+            self.tp_size,
         )
 
     def reset_remote_indexer_cache(self) -> None:

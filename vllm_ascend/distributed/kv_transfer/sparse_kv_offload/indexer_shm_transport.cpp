@@ -6,6 +6,12 @@
 
 extern "C" void indexer_shm_initialize_control_do(
     void* stream, uint8_t* gva, uint64_t symmetric_size, uint32_t rank);
+extern "C" void indexer_shm_tp_fanout_leader_do(
+    void* stream, uint8_t* gva, uint64_t symmetric_size, uint32_t leader_rank,
+    uint32_t group_size, uint8_t* source, uint32_t source_bytes);
+extern "C" void indexer_shm_tp_fanout_follower_do(
+    void* stream, uint8_t* gva, uint64_t symmetric_size, uint32_t rank,
+    uint32_t leader_rank, uint8_t* output, uint32_t output_bytes);
 extern "C" void indexer_shm_decoder_exchange_do(
     void* stream, uint8_t* gva, uint64_t symmetric_size, uint32_t decoder_rank,
     uint32_t service_rank, uint8_t* request, uint32_t request_bytes,
@@ -58,6 +64,37 @@ void CheckPayload(const at::Tensor& tensor, const char* name) {
   TORCH_CHECK(tensor.numel() > 0 && tensor.numel() <= kMaxPayloadBytes,
               name, " bytes must be in [1, 1 MiB], got ", tensor.numel());
   TORCH_CHECK(tensor.numel() % 32 == 0, name, " allocation must be 32-byte aligned");
+}
+
+void TpFanoutLeader(const at::Tensor& source, int64_t gva,
+                    int64_t symmetric_size, int64_t leader_rank,
+                    int64_t group_size, int64_t shm_world_size) {
+  CheckPayload(source, "source");
+  TORCH_CHECK(group_size > 1 && group_size <= 16,
+              "group_size must be in [2, 16]");
+  TORCH_CHECK(leader_rank >= 0 && leader_rank + group_size <= shm_world_size,
+              "TP group is outside SHM world");
+  auto stream = c10_npu::getCurrentNPUStream().stream();
+  indexer_shm_tp_fanout_leader_do(
+      stream, reinterpret_cast<uint8_t*>(gva), symmetric_size, leader_rank,
+      group_size, static_cast<uint8_t*>(source.data_ptr()), source.numel());
+}
+
+void TpFanoutFollower(at::Tensor& output, int64_t gva,
+                      int64_t symmetric_size, int64_t rank,
+                      int64_t leader_rank, int64_t shm_world_size) {
+  CheckPayload(output, "output");
+  TORCH_CHECK(shm_world_size > 0, "shm_world_size must be positive");
+  TORCH_CHECK(rank >= 0 && rank < shm_world_size,
+              "rank must be in SHM world [0, ", shm_world_size - 1, "]");
+  TORCH_CHECK(leader_rank >= 0 && leader_rank < shm_world_size,
+              "leader_rank must be in SHM world [0, ", shm_world_size - 1,
+              "]");
+  TORCH_CHECK(rank != leader_rank, "leader cannot use follower operation");
+  auto stream = c10_npu::getCurrentNPUStream().stream();
+  indexer_shm_tp_fanout_follower_do(
+      stream, reinterpret_cast<uint8_t*>(gva), symmetric_size, rank,
+      leader_rank, static_cast<uint8_t*>(output.data_ptr()), output.numel());
 }
 
 void DecoderExchange(const at::Tensor& request, at::Tensor& response,
@@ -178,6 +215,8 @@ void ServiceRespondProfiled(const at::Tensor& response, at::Tensor& trace,
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
   module.def("initialize_control", &InitializeControl);
+  module.def("tp_fanout_leader", &TpFanoutLeader);
+  module.def("tp_fanout_follower", &TpFanoutFollower);
   module.def("decoder_exchange", &DecoderExchange);
   module.def("service_receive", &ServiceReceive);
   module.def("service_respond", &ServiceRespond);
