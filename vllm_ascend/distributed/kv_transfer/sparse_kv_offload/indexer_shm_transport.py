@@ -162,6 +162,88 @@ class IndexerShmTransport:
         if self._handle.barrier() != 0:
             raise RuntimeError("MemFabric SHM barrier failed")
 
+    def service_resident_update(
+        self,
+        topk: torch.Tensor,
+        block_table: torch.Tensor,
+        slot_mapping: torch.Tensor,
+        resident_sources: torch.Tensor,
+        response: torch.Tensor,
+        block_size: int,
+    ) -> None:
+        self._extension.service_resident_update(
+            topk,
+            block_table,
+            slot_mapping,
+            resident_sources,
+            response,
+            block_size,
+        )
+
+    def decoder_resident_descriptors(
+        self,
+        encoded_sources: torch.Tensor,
+        gvas: torch.Tensor,
+        addrs: torch.Tensor,
+        sizes: torch.Tensor,
+        descriptor_count: torch.Tensor,
+        current_slots: torch.Tensor,
+        *,
+        gva_k_base: int,
+        gva_v_base: int,
+        addr_k_base: int,
+        addr_v_base: int,
+        token_bytes_k: int,
+        token_bytes_v: int,
+        resident_capacity: int,
+    ) -> None:
+        self._extension.decoder_resident_descriptors(
+            encoded_sources,
+            gvas,
+            addrs,
+            sizes,
+            descriptor_count,
+            current_slots,
+            gva_k_base,
+            gva_v_base,
+            addr_k_base,
+            addr_v_base,
+            token_bytes_k,
+            token_bytes_v,
+            resident_capacity,
+        )
+
+    def tp_fanout(
+        self,
+        tensor: torch.Tensor,
+        *,
+        leader_rank: int = 0,
+        group_size: int | None = None,
+    ) -> None:
+        if group_size is None:
+            group_size = self.world_size - leader_rank
+        payload = tensor.contiguous().view(torch.uint8).flatten()
+        if payload.numel() % ALIGNMENT != 0:
+            raise ValueError("TP fanout payload must be 32-byte aligned")
+        if self.global_rank == leader_rank:
+            self._extension.tp_fanout_leader(
+                payload,
+                self.gva,
+                self.symmetric_size,
+                leader_rank,
+                group_size,
+                self.world_size,
+            )
+        else:
+            self._extension.tp_fanout_follower(
+                payload,
+                self.gva,
+                self.symmetric_size,
+                self.global_rank,
+                leader_rank,
+                self.world_size,
+            )
+
     def decoder_exchange(
         self,
         request: torch.Tensor,
@@ -249,27 +331,75 @@ class ShmRemoteIndexerClient:
         topk: int,
         profile_device: bool = False,
         direct_pack: bool = False,
+        metadata_once_per_step: bool = False,
+        shm_world_size: int | None = None,
+        shm_global_rank: int | None = None,
+        shm_decoder_rank: int | None = None,
+        shm_service_rank: int | None = None,
     ) -> None:
         self.rank = rank
         self.topk = topk
         self.profile_device = profile_device
         self.direct_pack = direct_pack
+        self.metadata_once_per_step = metadata_once_per_step
+        if shm_world_size is None:
+            shm_world_size = decoder_world_size * 2
+        if shm_global_rank is None:
+            shm_global_rank = decoder_world_size + rank
+        if shm_decoder_rank is None:
+            shm_decoder_rank = decoder_world_size + rank
+        if shm_service_rank is None:
+            shm_service_rank = rank
         self._transport = IndexerShmTransport(
             store_url=store_url,
-            world_size=decoder_world_size * 2,
-            global_rank=decoder_world_size + rank,
+            world_size=shm_world_size,
+            global_rank=shm_global_rank,
             device=device,
-            decoder_rank=decoder_world_size + rank,
-            service_rank=rank,
+            decoder_rank=shm_decoder_rank,
+            service_rank=shm_service_rank,
         )
         self._packed: dict[tuple[object, ...], PackedTensors] = {}
         self._responses: dict[int, torch.Tensor] = {}
+        self._direct_pack_padding: dict[torch.device, torch.Tensor] = {}
         self._warned_control_noop = False
         logger.warning(
             "Remote indexer rank %d uses MemFabric SHM device transport; store=%s service_rank=%d",
             rank,
             store_url,
-            rank,
+            shm_service_rank,
+        )
+
+    def tp_fanout(
+        self,
+        response: torch.Tensor,
+        *,
+        leader_rank: int,
+        group_size: int,
+    ) -> None:
+        self._transport.tp_fanout(
+            response,
+            leader_rank=leader_rank,
+            group_size=group_size,
+        )
+
+    def build_resident_descriptors(
+        self,
+        encoded_sources: torch.Tensor,
+        gvas: torch.Tensor,
+        addrs: torch.Tensor,
+        sizes: torch.Tensor,
+        descriptor_count: torch.Tensor,
+        current_slots: torch.Tensor,
+        **geometry: int,
+    ) -> None:
+        self._transport.decoder_resident_descriptors(
+            encoded_sources,
+            gvas,
+            addrs,
+            sizes,
+            descriptor_count,
+            current_slots,
+            **geometry,
         )
 
     @staticmethod
@@ -291,7 +421,7 @@ class ShmRemoteIndexerClient:
         block_table: torch.Tensor,
         capturing: bool,
     ) -> torch.Tensor:
-        del layer_id, capturing
+        del capturing
         if q.dtype != torch.int8 or new_k.dtype != torch.int8:
             raise ValueError("SHM remote indexer requires the C8 indexer path")
         tensors = {
@@ -311,15 +441,31 @@ class ShmRemoteIndexerClient:
         if response is None:
             response = torch.empty(align32(response_bytes), dtype=torch.uint8, device=q.device)
             self._responses[tokens] = response
+        request_tensors = tensors
+        if self.metadata_once_per_step and layer_id != 0:
+            request_tensors = {
+                name: tensors[name]
+                for name in ("q", "q_scale", "weights", "new_k", "new_k_scale")
+            }
         if self.direct_pack:
-            self._transport.decoder_exchange_tensors(list(tensors.values()), response)
+            direct_tensors = list(request_tensors.values())
+            if len(direct_tensors) == 5:
+                padding = self._direct_pack_padding.get(q.device)
+                if padding is None:
+                    padding = torch.empty(1, dtype=torch.uint8, device=q.device)
+                    self._direct_pack_padding[q.device] = padding
+                # The v14 kernel has nine independent AIV lanes.  Four 1-byte
+                # padding segments keep its ABI while the service receives
+                # only the five aligned data segments.
+                direct_tensors.extend([padding] * 4)
+            self._transport.decoder_exchange_tensors(direct_tensors, response)
         else:
-            signature = self._signature(tensors)
+            signature = self._signature(request_tensors)
             packed = self._packed.get(signature)
             if packed is None:
-                packed = PackedTensors(tensors)
+                packed = PackedTensors(request_tensors)
                 self._packed[signature] = packed
-            request = packed.pack(tensors)
+            request = packed.pack(request_tensors)
             self._transport.decoder_exchange(
                 request, response, profiled=self.profile_device
             )

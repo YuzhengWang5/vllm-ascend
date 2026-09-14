@@ -13,6 +13,13 @@ import torch_npu
 from .indexer_shm_transport import IndexerShmTransport, PackedTensors, align32
 
 A3_CYCLES_PER_US = 50.0
+DATA_NAMES = ("q", "q_scale", "weights", "new_k", "new_k_scale")
+METADATA_NAMES = (
+    "slot_mapping",
+    "actual_seq_lengths_query",
+    "actual_seq_lengths_key",
+    "block_table",
+)
 
 
 def empty_request(args: argparse.Namespace, batch: int) -> dict[str, torch.Tensor]:
@@ -27,6 +34,11 @@ def empty_request(args: argparse.Namespace, batch: int) -> dict[str, torch.Tenso
         "actual_seq_lengths_key": torch.empty((batch,), dtype=torch.int32, device="npu"),
         "block_table": torch.empty((batch, args.block_table_cols), dtype=torch.int32, device="npu"),
     }
+
+
+def data_request(args: argparse.Namespace, batch: int) -> dict[str, torch.Tensor]:
+    full = empty_request(args, batch)
+    return {name: full[name] for name in DATA_NAMES}
 
 
 def make_cache(args: argparse.Namespace) -> tuple[torch.Tensor, torch.Tensor]:
@@ -66,6 +78,7 @@ def metadata_summary(tensors: dict[str, torch.Tensor], cache_blocks: int, block_
         "block_min": smallest_block,
         "block_max": largest_block,
         "valid_block_count": int(valid_blocks.numel()),
+        "unique_valid_block_count": int(torch.unique(valid_blocks).numel()),
         "block_ids_in_range": largest_block < cache_blocks,
         # -1 is the graph-padding sentinel accepted by ScatterNdUpdate.
         "slots_in_range": slot_min >= -1 and slot_max < cache_blocks * block_size,
@@ -116,22 +129,46 @@ def serve(args: argparse.Namespace) -> None:
     torch.npu.synchronize()
 
     requests: dict[int, PackedTensors] = {}
+    data_requests: dict[int, PackedTensors] = {}
     responses: dict[int, torch.Tensor] = {}
     graphs: dict[int, list[torch.npu.NPUGraph]] = {}
+    resident_sources: dict[int, list[torch.Tensor]] = {}
     trace = torch.empty((args.layers, 12), dtype=torch.int64, device="npu")
     for batch in args.batches:
         request = PackedTensors(empty_request(args, batch))
-        tensors = request.views()
+        full_tensors = request.views()
+        data_only_request = PackedTensors(data_request(args, batch))
+        data_only_tensors = data_only_request.views()
         response_bytes = batch * args.topk * 4
         response = torch.empty(align32(response_bytes), dtype=torch.uint8, device="npu")
+        batch_resident_sources = [
+            torch.full(
+                (batch, args.topk),
+                -1,
+                dtype=torch.int32,
+                device="npu",
+            )
+            for _ in range(args.layers)
+        ]
         batch_graphs: list[torch.npu.NPUGraph] = []
         for layer_id, (key_cache, scale_cache) in enumerate(caches):
+            if args.metadata_once_per_step and layer_id != 0:
+                active_request = data_only_request
+                tensors = {
+                    **data_only_tensors,
+                    **{name: full_tensors[name] for name in METADATA_NAMES},
+                }
+            else:
+                active_request = request
+                tensors = full_tensors
             graph = torch.npu.NPUGraph()
             with torch.inference_mode(), torch.npu.graph(graph):
                 if args.profile_device_breakdown:
-                    transport.service_receive_profiled(request.buffer, trace, layer_id)
+                    transport.service_receive_profiled(
+                        active_request.buffer, trace, layer_id
+                    )
                 else:
-                    transport.service_receive(request.buffer)
+                    transport.service_receive(active_request.buffer)
                 torch_npu.npu_scatter_nd_update_(
                     key_cache.view(-1, args.head_dim),
                     tensors["slot_mapping"].view(-1, 1),
@@ -158,7 +195,29 @@ def serve(args: argparse.Namespace) -> None:
                     sparse_count=args.topk,
                     sparse_mode=3,
                 )
-                response[:response_bytes].copy_(topk.view(torch.uint8).flatten())
+                if args.service_managed_resident:
+                    if args.force_resident_miss:
+                        # Controlled synthetic worst case: retain the service's
+                        # logical->physical mapping, but invalidate its resident
+                        # tags before every layer replay so the decoder really
+                        # reads every selected MLA token from the BM pool.
+                        batch_resident_sources[layer_id].fill_(-1)
+                    response_values = response[:response_bytes].view(
+                        torch.int32
+                    ).view(batch, args.topk)
+                    transport.service_resident_update(
+                        topk,
+                        tensors["block_table"],
+                        tensors["slot_mapping"],
+                        batch_resident_sources[layer_id],
+                        response_values,
+                        args.block_size,
+                    )
+                else:
+                    response_values = topk
+                    response[:response_bytes].copy_(
+                        response_values.view(torch.uint8).flatten()
+                    )
                 if args.profile_device_breakdown:
                     transport.service_respond_profiled(response, trace, layer_id)
                 else:
@@ -176,8 +235,10 @@ def serve(args: argparse.Namespace) -> None:
                     flush=True,
                 )
         requests[batch] = request
+        data_requests[batch] = data_only_request
         responses[batch] = response
         graphs[batch] = batch_graphs
+        resident_sources[batch] = batch_resident_sources
 
     print(
         json.dumps(
@@ -188,7 +249,13 @@ def serve(args: argparse.Namespace) -> None:
                 "layers": args.layers,
                 "batches": args.batches,
                 "request_bytes": {batch: requests[batch].buffer.numel() for batch in args.batches},
+                "data_request_bytes": {
+                    batch: data_requests[batch].buffer.numel()
+                    for batch in args.batches
+                },
+                "metadata_once_per_step": args.metadata_once_per_step,
                 "response_bytes": {batch: responses[batch].numel() for batch in args.batches},
+                "service_managed_resident": args.service_managed_resident,
             }
         ),
         flush=True,
@@ -206,13 +273,25 @@ def serve(args: argparse.Namespace) -> None:
 
     steady_batch = args.batches[-1]
     token_step = 0
+    debug_steady_done = not args.debug_first_token_metadata
     if args.debug_first_token_metadata:
         request = requests[steady_batch]
-        tensors = request.views()
+        full_tensors = request.views()
+        data_only_request = data_requests[steady_batch]
+        data_only_tensors = data_only_request.views()
         response = responses[steady_batch]
         response_bytes = steady_batch * args.topk * 4
         for layer_id, (key_cache, scale_cache) in enumerate(caches):
-            transport.service_receive(request.buffer)
+            if args.metadata_once_per_step and layer_id != 0:
+                active_request = data_only_request
+                tensors = {
+                    **data_only_tensors,
+                    **{name: full_tensors[name] for name in METADATA_NAMES},
+                }
+            else:
+                active_request = request
+                tensors = full_tensors
+            transport.service_receive(active_request.buffer)
             torch.npu.synchronize()
             summary = metadata_summary(tensors, args.cache_blocks, args.block_size)
             print(
@@ -255,9 +334,55 @@ def serve(args: argparse.Namespace) -> None:
                 sparse_count=args.topk,
                 sparse_mode=3,
             )
-            response[:response_bytes].copy_(topk.view(torch.uint8).flatten())
+            if args.service_managed_resident:
+                if args.force_resident_miss:
+                    resident_sources[steady_batch][layer_id].fill_(-1)
+                response_values = response[:response_bytes].view(
+                    torch.int32
+                ).view(steady_batch, args.topk)
+                transport.service_resident_update(
+                    topk,
+                    tensors["block_table"],
+                    tensors["slot_mapping"],
+                    resident_sources[steady_batch][layer_id],
+                    response_values,
+                    args.block_size,
+                )
+            else:
+                response_values = topk
+                response[:response_bytes].copy_(
+                    response_values.view(torch.uint8).flatten()
+                )
             transport.service_respond(response)
             torch.npu.synchronize()
+            if layer_id in (0, args.layers - 1):
+                response_cpu = response_values.cpu().reshape(-1)
+                valid_response = response_cpu[response_cpu >= 0]
+                print(
+                    json.dumps(
+                        {
+                            "event": "first_token_response",
+                            "layer_id": layer_id,
+                            "response_count": int(response_cpu.numel()),
+                            "valid_physical_sources": int(valid_response.numel()),
+                            "negative_sources": int((response_cpu < 0).sum()),
+                            "unique_physical_sources": int(
+                                torch.unique(valid_response).numel()
+                            ),
+                            "physical_source_min": (
+                                int(valid_response.min())
+                                if valid_response.numel()
+                                else -1
+                            ),
+                            "physical_source_max": (
+                                int(valid_response.max())
+                                if valid_response.numel()
+                                else -1
+                            ),
+                        }
+                    ),
+                    flush=True,
+                )
         token_step = 1
         print(json.dumps({"event": "debug_first_token_done"}), flush=True)
 
@@ -268,6 +393,33 @@ def serve(args: argparse.Namespace) -> None:
             graph.replay()
         torch.npu.synchronize()
         token_step += 1
+        # The first manually inspected pass can still be a one-sequence
+        # vLLM graph warmup.  Inspect the already-computed layer-60 response
+        # after subsequent replays until a genuinely populated batch arrives;
+        # this is a warmup-only correctness check and then disables itself.
+        if not debug_steady_done:
+            response_values = responses[steady_batch][: steady_batch * args.topk * 4].view(
+                torch.int32
+            ).view(steady_batch, args.topk)
+            response_cpu = response_values.cpu().reshape(-1)
+            valid_response = response_cpu[response_cpu >= 0]
+            if valid_response.numel() >= steady_batch * args.topk // 2:
+                summary = metadata_summary(full_tensors, args.cache_blocks, args.block_size)
+                print(
+                    json.dumps(
+                        {
+                            "event": "first_populated_batch",
+                            "step": token_step,
+                            **summary,
+                            "response_count": int(response_cpu.numel()),
+                            "valid_physical_sources": int(valid_response.numel()),
+                            "negative_sources": int((response_cpu < 0).sum()),
+                            "unique_physical_sources": int(torch.unique(valid_response).numel()),
+                        }
+                    ),
+                    flush=True,
+                )
+                debug_steady_done = True
         if args.profile_device_breakdown and args.profile_log_every > 0 and token_step % args.profile_log_every == 0:
             print(json.dumps(device_breakdown(trace, token_step)), flush=True)
         if token_step % args.log_every == 0:
@@ -300,6 +452,13 @@ def main() -> None:
     parser.add_argument("--debug-first-token-metadata", action="store_true")
     parser.add_argument("--profile-device-breakdown", action="store_true")
     parser.add_argument("--profile-log-every", type=int, default=0)
+    parser.add_argument("--service-managed-resident", action="store_true")
+    parser.add_argument(
+        "--force-resident-miss",
+        action="store_true",
+        help="invalidate service resident tags before every layer; synthetic bandwidth stress only",
+    )
+    parser.add_argument("--metadata-once-per-step", action="store_true")
     parser.add_argument("--pid-file")
     args = parser.parse_args()
     if len(set(args.batches)) != len(args.batches):
