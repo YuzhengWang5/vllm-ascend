@@ -6,6 +6,18 @@
 
 extern "C" void indexer_shm_initialize_control_do(
     void* stream, uint8_t* gva, uint64_t symmetric_size, uint32_t rank);
+extern "C" void indexer_shm_service_resident_update_do(
+    void* stream, int32_t* topk, int32_t* block_table,
+    int32_t* slot_mapping, int32_t* resident_sources, int32_t* response,
+    uint64_t count, uint32_t topk_size, uint32_t block_table_cols,
+    uint32_t block_size);
+extern "C" void indexer_shm_decoder_resident_descriptors_do(
+    void* stream, int32_t* encoded_sources, int64_t* gvas, int64_t* addrs,
+    int32_t* sizes, int32_t* descriptor_count, int32_t* current_slots,
+    uint64_t count, uint64_t gva_k_base, uint64_t gva_v_base,
+    uint64_t addr_k_base, uint64_t addr_v_base, uint32_t token_bytes_k,
+    uint32_t token_bytes_v, uint32_t topk_size,
+    uint32_t resident_capacity);
 extern "C" void indexer_shm_tp_fanout_leader_do(
     void* stream, uint8_t* gva, uint64_t symmetric_size, uint32_t leader_rank,
     uint32_t group_size, uint8_t* source, uint32_t source_bytes);
@@ -54,6 +66,84 @@ void InitializeControl(int64_t gva, int64_t symmetric_size, int64_t rank) {
   auto stream = c10_npu::getCurrentNPUStream().stream();
   indexer_shm_initialize_control_do(
       stream, reinterpret_cast<uint8_t*>(gva), symmetric_size, rank);
+}
+
+void CheckNpuTensor(const at::Tensor& tensor, at::ScalarType dtype,
+                    const char* name) {
+  TORCH_CHECK(tensor.device().type() == c10::DeviceType::PrivateUse1,
+              name, " must be an NPU tensor");
+  TORCH_CHECK(tensor.scalar_type() == dtype, name, " has wrong dtype");
+  TORCH_CHECK(tensor.is_contiguous(), name, " must be contiguous");
+}
+
+void ServiceResidentUpdate(const at::Tensor& topk,
+                           const at::Tensor& block_table,
+                           const at::Tensor& slot_mapping,
+                           at::Tensor& resident_sources,
+                           at::Tensor& response, int64_t block_size) {
+  CheckNpuTensor(topk, at::kInt, "topk");
+  CheckNpuTensor(block_table, at::kInt, "block_table");
+  CheckNpuTensor(slot_mapping, at::kInt, "slot_mapping");
+  CheckNpuTensor(resident_sources, at::kInt, "resident_sources");
+  CheckNpuTensor(response, at::kInt, "response");
+  TORCH_CHECK((topk.dim() == 2 || topk.dim() == 3) &&
+                  block_table.dim() == 2,
+              "topk must be rank-2/3 and block_table rank-2");
+  const int64_t topk_size = topk.size(-1);
+  const int64_t rows = topk.numel() / topk_size;
+  TORCH_CHECK(slot_mapping.numel() == rows,
+              "slot_mapping rows must equal topk rows");
+  TORCH_CHECK(resident_sources.numel() == topk.numel() &&
+                  response.numel() == topk.numel(),
+              "resident_sources and response must match topk elements");
+  TORCH_CHECK(block_table.size(0) == rows,
+              "block_table rows must equal topk rows");
+  TORCH_CHECK(block_size > 0, "block_size must be positive");
+  auto stream = c10_npu::getCurrentNPUStream().stream();
+  indexer_shm_service_resident_update_do(
+      stream, static_cast<int32_t*>(topk.data_ptr()),
+      static_cast<int32_t*>(block_table.data_ptr()),
+      static_cast<int32_t*>(slot_mapping.data_ptr()),
+      static_cast<int32_t*>(resident_sources.data_ptr()),
+      static_cast<int32_t*>(response.data_ptr()), topk.numel(), topk_size,
+      block_table.size(1), block_size);
+}
+
+void DecoderResidentDescriptors(
+    const at::Tensor& encoded_sources, at::Tensor& gvas, at::Tensor& addrs,
+    at::Tensor& sizes, at::Tensor& descriptor_count,
+    at::Tensor& current_slots, int64_t gva_k_base, int64_t gva_v_base,
+    int64_t addr_k_base, int64_t addr_v_base, int64_t token_bytes_k,
+    int64_t token_bytes_v, int64_t resident_capacity) {
+  CheckNpuTensor(encoded_sources, at::kInt, "encoded_sources");
+  CheckNpuTensor(gvas, at::kLong, "gvas");
+  CheckNpuTensor(addrs, at::kLong, "addrs");
+  CheckNpuTensor(sizes, at::kInt, "sizes");
+  CheckNpuTensor(descriptor_count, at::kInt, "descriptor_count");
+  CheckNpuTensor(current_slots, at::kInt, "current_slots");
+  TORCH_CHECK(encoded_sources.dim() == 2,
+              "encoded_sources must be rank-2");
+  const int64_t count = encoded_sources.numel();
+  TORCH_CHECK(gvas.numel() >= 2 * count && addrs.numel() >= 2 * count &&
+                  sizes.numel() >= 2 * count,
+              "descriptor buffers are too small");
+  TORCH_CHECK(current_slots.numel() >= count,
+              "current_slots buffer is too small");
+  TORCH_CHECK(descriptor_count.numel() >= 1,
+              "descriptor_count must have one element");
+  TORCH_CHECK(token_bytes_k > 0 && token_bytes_v > 0 &&
+                  resident_capacity >= encoded_sources.size(1),
+              "invalid resident descriptor geometry");
+  auto stream = c10_npu::getCurrentNPUStream().stream();
+  indexer_shm_decoder_resident_descriptors_do(
+      stream, static_cast<int32_t*>(encoded_sources.data_ptr()),
+      static_cast<int64_t*>(gvas.data_ptr()),
+      static_cast<int64_t*>(addrs.data_ptr()),
+      static_cast<int32_t*>(sizes.data_ptr()),
+      static_cast<int32_t*>(descriptor_count.data_ptr()),
+      static_cast<int32_t*>(current_slots.data_ptr()), count, gva_k_base,
+      gva_v_base, addr_k_base, addr_v_base, token_bytes_k, token_bytes_v,
+      encoded_sources.size(1), resident_capacity);
 }
 
 void CheckPayload(const at::Tensor& tensor, const char* name) {
@@ -215,6 +305,8 @@ void ServiceRespondProfiled(const at::Tensor& response, at::Tensor& trace,
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
   module.def("initialize_control", &InitializeControl);
+  module.def("service_resident_update", &ServiceResidentUpdate);
+  module.def("decoder_resident_descriptors", &DecoderResidentDescriptors);
   module.def("tp_fanout_leader", &TpFanoutLeader);
   module.def("tp_fanout_follower", &TpFanoutFollower);
   module.def("decoder_exchange", &DecoderExchange);

@@ -162,6 +162,57 @@ class IndexerShmTransport:
         if self._handle.barrier() != 0:
             raise RuntimeError("MemFabric SHM barrier failed")
 
+    def service_resident_update(
+        self,
+        topk: torch.Tensor,
+        block_table: torch.Tensor,
+        slot_mapping: torch.Tensor,
+        resident_sources: torch.Tensor,
+        response: torch.Tensor,
+        block_size: int,
+    ) -> None:
+        self._extension.service_resident_update(
+            topk,
+            block_table,
+            slot_mapping,
+            resident_sources,
+            response,
+            block_size,
+        )
+
+    def decoder_resident_descriptors(
+        self,
+        encoded_sources: torch.Tensor,
+        gvas: torch.Tensor,
+        addrs: torch.Tensor,
+        sizes: torch.Tensor,
+        descriptor_count: torch.Tensor,
+        current_slots: torch.Tensor,
+        *,
+        gva_k_base: int,
+        gva_v_base: int,
+        addr_k_base: int,
+        addr_v_base: int,
+        token_bytes_k: int,
+        token_bytes_v: int,
+        resident_capacity: int,
+    ) -> None:
+        self._extension.decoder_resident_descriptors(
+            encoded_sources,
+            gvas,
+            addrs,
+            sizes,
+            descriptor_count,
+            current_slots,
+            gva_k_base,
+            gva_v_base,
+            addr_k_base,
+            addr_v_base,
+            token_bytes_k,
+            token_bytes_v,
+            resident_capacity,
+        )
+
     def tp_fanout(
         self,
         tensor: torch.Tensor,
@@ -329,6 +380,26 @@ class ShmRemoteIndexerClient:
             response,
             leader_rank=leader_rank,
             group_size=group_size,
+        )
+
+    def build_resident_descriptors(
+        self,
+        encoded_sources: torch.Tensor,
+        gvas: torch.Tensor,
+        addrs: torch.Tensor,
+        sizes: torch.Tensor,
+        descriptor_count: torch.Tensor,
+        current_slots: torch.Tensor,
+        **geometry: int,
+    ) -> None:
+        self._transport.decoder_resident_descriptors(
+            encoded_sources,
+            gvas,
+            addrs,
+            sizes,
+            descriptor_count,
+            current_slots,
+            **geometry,
         )
 
     @staticmethod

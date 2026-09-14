@@ -1037,6 +1037,9 @@ class SparseKVOffloadConfig:
 
         self.topk_buffer_size = int(user_config.get("topk_buffer_size", 4096))
         self.dram_size_per_dp_GB = int(user_config.get("dram_size_per_dp_GB", 128))
+        self.offload_store_port_base = int(
+            user_config.get("offload_store_port_base", 8500)
+        )
         self.keep_device_kv_cache = bool(user_config.get("keep_device_kv_cache", False))
         self.motivation_baseline = str(
             user_config.get("motivation_baseline", "colocated")
@@ -1080,6 +1083,9 @@ class SparseKVOffloadConfig:
         self.remote_indexer_metadata_once_per_step = bool(
             user_config.get("remote_indexer_metadata_once_per_step", False)
         )
+        self.remote_indexer_service_managed_resident = bool(
+            user_config.get("remote_indexer_service_managed_resident", False)
+        )
         self.remote_indexer_enabled = bool(self.remote_indexer_host)
         supported_motivation_baselines = {
             "colocated",
@@ -1098,6 +1104,18 @@ class SparseKVOffloadConfig:
                 "sparse_kv_offload_config.remote_indexer_base_port must leave "
                 "room for rank-local ports, got "
                 f"{self.remote_indexer_base_port}"
+            )
+        max_offload_store_port = (
+            self.offload_store_port_base
+            + vllm_config.parallel_config.data_parallel_size
+            - 1
+        )
+        if self.offload_store_port_base < 1 or max_offload_store_port > 65535:
+            raise ValueError(
+                "sparse_kv_offload_config.offload_store_port_base must leave "
+                "one local rendezvous port per DP rank, got base "
+                f"{self.offload_store_port_base} for DP size "
+                f"{vllm_config.parallel_config.data_parallel_size}"
             )
         if self.remote_indexer_connect_timeout_s <= 0:
             raise ValueError(
@@ -1147,6 +1165,13 @@ class SparseKVOffloadConfig:
         ):
             raise ValueError(
                 "remote_indexer_metadata_once_per_step is only supported by SHM transport"
+            )
+        if (
+            self.remote_indexer_service_managed_resident
+            and self.remote_indexer_transport != "shm"
+        ):
+            raise ValueError(
+                "remote_indexer_service_managed_resident is only supported by SHM transport"
             )
         if self.remote_indexer_enabled and self.motivation_baseline != "colocated":
             raise ValueError(

@@ -339,11 +339,35 @@ class SparseKVOffloadManager:
         self.remote_indexer_verify_tp_inputs = (
             sparse_kv_offload_config.remote_indexer_verify_tp_inputs
         )
+        self.remote_indexer_service_managed_resident = (
+            sparse_kv_offload_config.remote_indexer_service_managed_resident
+        )
         self._remote_indexer_tp_responses: dict[int, torch.Tensor] = {}
         self._verified_remote_indexer_layers: set[int] = set()
         self.remote_indexer_is_leader = True
         self.remote_indexer_tp_leader_shm_rank: int | None = None
         self.remote_indexer_client = None
+
+        # The service may intentionally be launched only after checkpoint load
+        # and host page-cache reclamation.  Gate before constructing the SHM
+        # client; gating only the later CPU-pool allocation still lets
+        # smem_shm_init exhaust its connection retries before the service is up.
+        init_gate_file = sparse_kv_offload_config.remote_indexer_init_gate_file
+        if init_gate_file:
+            logger.warning(
+                "Sparse KV offload waits for remote-indexer init gate: %s",
+                init_gate_file,
+            )
+            deadline = time.monotonic() + 1200
+            while not os.path.exists(init_gate_file):
+                if time.monotonic() >= deadline:
+                    raise TimeoutError(
+                        "Timed out waiting for Sparse KV offload init gate: "
+                        f"{init_gate_file}"
+                    )
+                time.sleep(0.5)
+            logger.info("Sparse KV offload remote-indexer init gate opened")
+
         if sparse_kv_offload_config.remote_indexer_enabled:
             if self.remote_indexer_share_within_tp:
                 remote_rank = self.dp_rank
@@ -454,22 +478,6 @@ class SparseKVOffloadManager:
                 self.sparse_kv_offload_cpp.enqueue_remote_indexer_subscribed_callback
             )
 
-        init_gate_file = sparse_kv_offload_config.remote_indexer_init_gate_file
-        if init_gate_file:
-            logger.warning(
-                "Sparse KV offload waits for host-memory init gate: %s",
-                init_gate_file,
-            )
-            deadline = time.monotonic() + 1200
-            while not os.path.exists(init_gate_file):
-                if time.monotonic() >= deadline:
-                    raise TimeoutError(
-                        "Timed out waiting for Sparse KV offload init gate: "
-                        f"{init_gate_file}"
-                    )
-                time.sleep(0.5)
-            logger.info("Sparse KV offload host-memory init gate opened")
-
         logger.info(
             "SparseKVOffloadManager start init CPU KV pool with %s "
             "GB dram per dp group, it might be time consuming, please wait.",
@@ -482,8 +490,58 @@ class SparseKVOffloadManager:
         config.world_size = self.tp_size
         config.rank_id = self.tp_rank
         config.scene = offload.Scene.SHARED
+        # Each DP rank owns an independent TP-shared pool.  Reusing the
+        # MemFabric default store (tcp://127.0.0.1:8500) lets both TP leaders
+        # bind with SO_REUSEPORT and mixes their rank registrations
+        # nondeterministically.  A rank-local store port keeps the two
+        # collectives disjoint while preserving one continuous GVA per DP.
+        config.store_url = (
+            "tcp://127.0.0.1:"
+            f"{sparse_kv_offload_config.offload_store_port_base + self.dp_rank}"
+        )
+        logger.info(
+            "Sparse KV offload DP %s uses MemFabric store %s",
+            self.dp_rank,
+            config.store_url,
+        )
+
+        # HalMemCreate does not reclaim Linux page cache and large concurrent
+        # owners can race for the same backing zones even after drop_caches.
+        # Serialize DP-pool creation when the orchestration gate is available:
+        # the lower DP rank finishes its complete TP-shared pool before the
+        # next DP rank starts allocating.  This is initialization-only and has
+        # no effect on the decode hot path.
+        previous_dp_pool_gate = None
+        this_dp_pool_gate = None
+        if init_gate_file and parallel_config.data_parallel_size > 1:
+            this_dp_pool_gate = f"{init_gate_file}.dp{self.dp_rank}_pool_ready"
+            if self.dp_rank > 0:
+                previous_dp_pool_gate = (
+                    f"{init_gate_file}.dp{self.dp_rank - 1}_pool_ready"
+                )
+                logger.info(
+                    "Sparse KV offload DP %s waits for previous pool gate %s",
+                    self.dp_rank,
+                    previous_dp_pool_gate,
+                )
+                deadline = time.monotonic() + 1200
+                while not os.path.exists(previous_dp_pool_gate):
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError(
+                            "Timed out waiting for previous DP pool gate: "
+                            f"{previous_dp_pool_gate}"
+                        )
+                    time.sleep(0.2)
         assert offload.initialize(config) == 0, "Sparse KV offload offload.initialize failed."
         self.tp_group.barrier()
+        if self.tp_rank == 0 and this_dp_pool_gate is not None:
+            fd = os.open(this_dp_pool_gate, os.O_CREAT | os.O_WRONLY, 0o600)
+            os.close(fd)
+            logger.info(
+                "Sparse KV offload DP %s opened pool gate %s",
+                self.dp_rank,
+                this_dp_pool_gate,
+            )
 
     def _build_cpp(self):
         os.environ["TORCH_EXTENSIONS_ALWAYS_BUILD"] = "1"
@@ -1144,6 +1202,18 @@ class SparseKVOffloadManager:
                 non_blocking=capturing,
             )
             return
+        if self.remote_indexer_service_managed_resident:
+            if skip_topk:
+                raise RuntimeError(
+                    "service-managed resident cache does not support skip_topk layers"
+                )
+            self._onload_service_managed_resident(
+                layer_id,
+                num_tokens,
+                topk_indices_npu,
+                current_slots_npu,
+            )
+            return
         if layer_id in [0, self.mtp_layer_id]:
             # metadata which are same across all layers, only compute/copy once in first layer.
             # last layer (mtp layer) may have different metadata, do not skip.
@@ -1246,6 +1316,49 @@ class SparseKVOffloadManager:
 
         current_slots_cpu = self.lru_current_slots_cpu[:num_tokens]
         current_slots_npu[:num_tokens].copy_(current_slots_cpu, non_blocking=capturing)
+
+    def _onload_service_managed_resident(
+        self,
+        layer_id: int,
+        num_tokens: int,
+        miss_sources_npu: torch.Tensor,
+        current_slots_npu: torch.Tensor,
+    ) -> None:
+        """Build fixed-shape H2D descriptors with one graph-safe AIV launch."""
+        encoded_sources = miss_sources_npu[:num_tokens].reshape(
+            num_tokens, self.topk
+        )
+        descriptor_rows = encoded_sources.numel()
+        if self.remote_indexer_client is None:
+            raise RuntimeError("service-managed resident path requires SHM client")
+        self.remote_indexer_client.build_resident_descriptors(
+            encoded_sources,
+            self.gvas_buffer_npu[: 2 * descriptor_rows],
+            self.addr_buffer_npu[: 2 * descriptor_rows],
+            self.size_buffer_npu[: 2 * descriptor_rows],
+            self.num_tokens_buffer_npu,
+            current_slots_npu[:num_tokens],
+            gva_k_base=self.gvas_k_bases[layer_id],
+            gva_v_base=self.gvas_v_bases[layer_id],
+            addr_k_base=self.addr_k_bases[layer_id],
+            addr_v_base=self.addr_v_bases[layer_id],
+            token_bytes_k=self.token_size_bytes_k,
+            token_bytes_v=self.token_size_bytes_v,
+            resident_capacity=self.topk_buffer_size,
+        )
+
+        if self.tp_size > 1:
+            self.tp_group.broadcast(
+                torch.empty([], dtype=torch.int8, device="npu"), src=0
+            )
+        offload.sparse_copy(
+            self.gvas_buffer_npu,
+            self.addr_buffer_npu,
+            self.size_buffer_npu,
+            self.num_tokens_buffer_npu,
+            self.topk_buffers_k[0].device,
+        )
+
 
     def _onload_topk_kv_cpu(self, args):
         # code that is incompatible with graph mode, compute here outside graph
