@@ -1037,6 +1037,9 @@ class SparseKVOffloadConfig:
 
         self.topk_buffer_size = int(user_config.get("topk_buffer_size", 4096))
         self.dram_size_per_dp_GB = int(user_config.get("dram_size_per_dp_GB", 128))
+        self.dram_limited_capacity = bool(
+            user_config.get("dram_limited_capacity", False)
+        )
         self.offload_store_port_base = int(
             user_config.get("offload_store_port_base", 8500)
         )

@@ -635,11 +635,38 @@ class NPUWorker(WorkerBase):
             kv_cache_spec = getattr(self, "kv_cache_spec", None) or self.get_kv_cache_spec()
             host_device_memory_usage_ratio = get_host_device_memory_usage_ratio(kv_cache_spec)
             needed_dram_size_bytes = host_device_memory_usage_ratio * available_memory
-        if needed_dram_size_bytes > sparse_kv_offload_config.dram_size_per_dp_GB * (1 << 30):
-            raise ValueError(
-                f"Needed dram size ({GiB(needed_dram_size_bytes)} GB) is larger than "
-                f"user specified dram size ({sparse_kv_offload_config.dram_size_per_dp_GB} GB). "
-                "Please increase sparse_kv_offload_config.dram_size_per_dp_GB if available on your device."
+        configured_dram_size_bytes = (
+            sparse_kv_offload_config.dram_size_per_dp_GB * (1 << 30)
+        )
+        if needed_dram_size_bytes > configured_dram_size_bytes:
+            if (
+                not sparse_kv_offload_config.dram_limited_capacity
+                or keep_device_kv_cache
+            ):
+                raise ValueError(
+                    f"Needed dram size ({GiB(needed_dram_size_bytes)} GB) is larger than "
+                    f"user specified dram size ({sparse_kv_offload_config.dram_size_per_dp_GB} GB). "
+                    "Please increase sparse_kv_offload_config.dram_size_per_dp_GB if available on your device."
+                )
+
+            # The original calculation assumes enough host memory to pair with
+            # every byte available for the device-resident index cache.  On a
+            # high-DP deployment the per-DP host pool can be the tighter
+            # resource.  In that case, expose only the block capacity for
+            # which both cache components fit instead of failing startup.  The
+            # scheduler then reports the real, host-limited capacity and
+            # rejects larger batches normally.
+            available_memory = min(
+                available_memory,
+                int(configured_dram_size_bytes / host_device_memory_usage_ratio),
+            )
+            needed_dram_size_bytes = host_device_memory_usage_ratio * available_memory
+            logger.warning_once(
+                "Sparse KV offload host pool limits usable device index cache "
+                "memory to %.2f GiB and host cache memory to %.2f GiB.",
+                GiB(available_memory),
+                GiB(needed_dram_size_bytes),
+                scope="local",
             )
         if not keep_device_kv_cache:
             available_memory += needed_dram_size_bytes
