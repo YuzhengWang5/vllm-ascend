@@ -278,6 +278,12 @@ class IndexerShmTransport:
     def service_receive(self, request: torch.Tensor) -> None:
         self._extension.service_receive(request, self.gva, self.symmetric_size, self.service_rank)
 
+    def service_peek_request(self, control: torch.Tensor) -> None:
+        """Wait for, but do not consume, the next request doorbell."""
+        self._extension.service_peek_request(
+            control, self.gva, self.symmetric_size, self.service_rank
+        )
+
     def service_receive_profiled(self, request: torch.Tensor, trace: torch.Tensor, layer_id: int) -> None:
         self._extension.service_receive_profiled(
             request,

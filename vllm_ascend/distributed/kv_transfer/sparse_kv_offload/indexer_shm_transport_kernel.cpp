@@ -336,6 +336,20 @@ __aicore__ inline uint32_t ReadSequence(__gm__ uint32_t* doorbell) {
   return control.GetValue(0);
 }
 
+__aicore__ inline uint32_t ReadControlWord(__gm__ uint32_t* doorbell,
+                                           uint32_t index) {
+  auto ub = ControlUb();
+  AscendC::SetFlag<AscendC::HardEvent::S_MTE2>(kCopyEvent);
+  AscendC::WaitFlag<AscendC::HardEvent::S_MTE2>(kCopyEvent);
+  smem_shm_copy_gm2ub(ub, doorbell, 32U);
+  AscendC::SetFlag<AscendC::HardEvent::MTE2_S>(kCopyEvent);
+  AscendC::WaitFlag<AscendC::HardEvent::MTE2_S>(kCopyEvent);
+  AscendC::LocalTensor<uint32_t> control;
+  control.address_.logicPos = static_cast<uint8_t>(AscendC::TPosition::VECIN);
+  control.address_.bufferAddr = reinterpret_cast<uint64_t>(ub);
+  return control.GetValue(index);
+}
+
 __aicore__ inline void WriteSequence(__gm__ uint32_t* doorbell,
                                      uint32_t sequence) {
   auto ub = ControlUb();
@@ -343,6 +357,22 @@ __aicore__ inline void WriteSequence(__gm__ uint32_t* doorbell,
   control.address_.logicPos = static_cast<uint8_t>(AscendC::TPosition::VECIN);
   control.address_.bufferAddr = reinterpret_cast<uint64_t>(ub);
   control.SetValue(0, sequence);
+  AscendC::SetFlag<AscendC::HardEvent::S_MTE3>(kCopyEvent);
+  AscendC::WaitFlag<AscendC::HardEvent::S_MTE3>(kCopyEvent);
+  smem_shm_copy_ub2gm(doorbell, ub, 32U);
+  AscendC::SetFlag<AscendC::HardEvent::MTE3_S>(kCopyEvent);
+  AscendC::WaitFlag<AscendC::HardEvent::MTE3_S>(kCopyEvent);
+}
+
+__aicore__ inline void WriteRequestControl(__gm__ uint32_t* doorbell,
+                                           uint32_t sequence,
+                                           uint32_t request_bytes) {
+  auto ub = ControlUb();
+  AscendC::LocalTensor<uint32_t> control;
+  control.address_.logicPos = static_cast<uint8_t>(AscendC::TPosition::VECIN);
+  control.address_.bufferAddr = reinterpret_cast<uint64_t>(ub);
+  control.SetValue(0, sequence);
+  control.SetValue(1, request_bytes);
   AscendC::SetFlag<AscendC::HardEvent::S_MTE3>(kCopyEvent);
   AscendC::WaitFlag<AscendC::HardEvent::S_MTE3>(kCopyEvent);
   smem_shm_copy_ub2gm(doorbell, ub, 32U);
@@ -540,9 +570,26 @@ indexer_shm_decoder_exchange(GM_ADDR gva_addr, uint64_t symmetric_size,
   const uint32_t sequence = ReadSequence(decoder_doorbell) + 1U;
   const uint32_t slot = sequence & 1U;
   CopyGmToGm(PayloadSlot(service_base, slot), request, request_bytes);
-  WriteSequence(service_doorbell, sequence);
+  WriteRequestControl(service_doorbell, sequence, request_bytes);
   WaitSequence(decoder_doorbell, sequence);
   CopyGmToGm(response, PayloadSlot(decoder_base, slot), response_bytes);
+}
+
+[[bisheng::core_ratio(0, 1)]] __global__ __aicore__ void
+indexer_shm_service_peek_request(GM_ADDR gva_addr, uint64_t symmetric_size,
+                                 uint32_t service_rank,
+                                 GM_ADDR control_addr) {
+  symmetric_size = smem_shm_get_symmetric_size();
+  auto gva = reinterpret_cast<__gm__ uint8_t*>(gva_addr);
+  auto control = reinterpret_cast<__gm__ uint8_t*>(control_addr);
+  auto service_base = RankBase(gva, symmetric_size, service_rank);
+  auto request_doorbell =
+      reinterpret_cast<__gm__ uint32_t*>(service_base + kRequestDoorbellOffset);
+  auto seen_doorbell =
+      reinterpret_cast<__gm__ uint32_t*>(service_base + kServiceSeenOffset);
+  const uint32_t sequence = ReadSequence(seen_doorbell) + 1U;
+  WaitSequence(request_doorbell, sequence);
+  CopyGmToGm(control, reinterpret_cast<__gm__ uint8_t*>(request_doorbell), 32U);
 }
 
 [[bisheng::core_ratio(0, 1)]] __global__ __aicore__ void
@@ -602,7 +649,7 @@ indexer_shm_decoder_exchange_profiled(
   const uint32_t slot = sequence & 1U;
   const uint64_t start = ReadCycle();
   CopyGmToGm(PayloadSlot(service_base, slot), request, request_bytes);
-  WriteSequence(service_doorbell, sequence);
+  WriteRequestControl(service_doorbell, sequence, request_bytes);
   const uint64_t request_sent = ReadCycle();
   WaitSequence(decoder_doorbell, sequence);
   const uint64_t response_ready = ReadCycle();
@@ -645,6 +692,7 @@ indexer_shm_decoder_exchange_tensors_profiled(
   const uint32_t offset6 = offset5 + Align32(bytes5);
   const uint32_t offset7 = offset6 + Align32(bytes6);
   const uint32_t offset8 = offset7 + Align32(bytes7);
+  const uint32_t request_bytes = offset8 + Align32(bytes8);
   uint64_t start = 0;
   AscendC::SyncAll<true>();
   if (core_id == 0U) {
@@ -679,7 +727,7 @@ indexer_shm_decoder_exchange_tensors_profiled(
   if (core_id != 0U) {
     return;
   }
-  WriteSequence(service_doorbell, sequence);
+  WriteRequestControl(service_doorbell, sequence, request_bytes);
   const uint64_t request_sent = ReadCycle();
   WaitSequence(decoder_doorbell, sequence);
   const uint64_t response_ready = ReadCycle();
@@ -812,6 +860,14 @@ extern "C" void indexer_shm_service_receive_do(
     uint8_t* request, uint32_t request_bytes) {
   indexer_shm_service_receive<<<1, nullptr, stream>>>(
       gva, symmetric_size, service_rank, request, request_bytes);
+}
+
+extern "C" void indexer_shm_service_peek_request_do(
+    void* stream, uint8_t* gva, uint64_t symmetric_size,
+    uint32_t service_rank, int32_t* control) {
+  indexer_shm_service_peek_request<<<1, nullptr, stream>>>(
+      gva, symmetric_size, service_rank,
+      reinterpret_cast<uint8_t*>(control));
 }
 
 extern "C" void indexer_shm_service_respond_do(

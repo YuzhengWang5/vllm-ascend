@@ -134,6 +134,7 @@ def serve(args: argparse.Namespace) -> None:
     graphs: dict[int, list[torch.npu.NPUGraph]] = {}
     resident_sources: dict[int, list[torch.Tensor]] = {}
     trace = torch.empty((args.layers, 12), dtype=torch.int64, device="npu")
+    graph_pool = torch.npu.graph_pool_handle()
     for batch in args.batches:
         request = PackedTensors(empty_request(args, batch))
         full_tensors = request.views()
@@ -162,7 +163,7 @@ def serve(args: argparse.Namespace) -> None:
                 active_request = request
                 tensors = full_tensors
             graph = torch.npu.NPUGraph()
-            with torch.inference_mode(), torch.npu.graph(graph):
+            with torch.inference_mode(), torch.npu.graph(graph, pool=graph_pool):
                 if args.profile_device_breakdown:
                     transport.service_receive_profiled(
                         active_request.buffer, trace, layer_id
@@ -386,7 +387,31 @@ def serve(args: argparse.Namespace) -> None:
         token_step = 1
         print(json.dumps({"event": "debug_first_token_done"}), flush=True)
 
+    request_bytes_to_batch = {
+        int(request.buffer.numel()): batch for batch, request in requests.items()
+    }
+    if len(request_bytes_to_batch) != len(requests):
+        raise RuntimeError("full request byte sizes must uniquely identify graph batches")
+    request_control = torch.empty(8, dtype=torch.int32, device="npu")
+    seen_dynamic_batches: set[int] = set()
     while args.max_token_steps <= 0 or token_step < args.max_token_steps:
+        if args.dynamic_batch_by_request_bytes:
+            transport.service_peek_request(request_control)
+            request_bytes = int(request_control.cpu()[1])
+            try:
+                steady_batch = request_bytes_to_batch[request_bytes]
+            except KeyError as error:
+                raise RuntimeError(
+                    f"unknown full request size {request_bytes}; expected "
+                    f"{request_bytes_to_batch}"
+                ) from error
+            if steady_batch not in seen_dynamic_batches:
+                print(json.dumps({
+                    "event": "dynamic_batch_selected",
+                    "batch": steady_batch,
+                    "request_bytes": request_bytes,
+                }), flush=True)
+                seen_dynamic_batches.add(steady_batch)
         # Queue a whole model pass.  Each receive kernel blocks on its own
         # doorbell, while later layer graphs are already queued on the stream.
         for graph in graphs[steady_batch]:
@@ -459,6 +484,7 @@ def main() -> None:
         help="invalidate service resident tags before every layer; synthetic bandwidth stress only",
     )
     parser.add_argument("--metadata-once-per-step", action="store_true")
+    parser.add_argument("--dynamic-batch-by-request-bytes", action="store_true")
     parser.add_argument("--pid-file")
     args = parser.parse_args()
     if len(set(args.batches)) != len(args.batches):
