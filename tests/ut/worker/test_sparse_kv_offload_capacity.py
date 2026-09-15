@@ -14,6 +14,16 @@ def _worker():
     )
 
 
+def _worker_with_host_layers(num_layers: int):
+    return SimpleNamespace(
+        cache_config=SimpleNamespace(num_gpu_blocks_override=None),
+        kv_cache_spec={
+            f"host-layer-{index}": SimpleNamespace(store_on_host=True)
+            for index in range(num_layers)
+        },
+    )
+
+
 def _config(*, pool_gib: int, cap_to_pool: bool, keep_device: bool = False):
     return SimpleNamespace(
         enabled=True,
@@ -50,6 +60,32 @@ def test_dram_limited_capacity_caps_device_and_host_components():
     )
 
     assert result == 45 * GiB_bytes
+
+
+def test_dram_limited_capacity_reserves_per_layer_alignment_overhead():
+    num_layers = 78
+    alignment_overhead = num_layers * 3 * 2 * 1024 * 1024
+    usable_host_bytes = 40 * GiB_bytes - alignment_overhead
+    device_bytes = int(usable_host_bytes / 8.0)
+
+    result = _update(
+        _worker_with_host_layers(num_layers),
+        _config(pool_gib=40, cap_to_pool=True),
+        available_gib=14,
+        ratio=8.0,
+    )
+
+    assert result == int(device_bytes + 8.0 * device_bytes)
+
+
+def test_dram_limited_capacity_rejects_pool_smaller_than_alignment_reserve():
+    with pytest.raises(ValueError, match="alignment reserve"):
+        _update(
+            _worker_with_host_layers(200),
+            _config(pool_gib=1, cap_to_pool=True),
+            available_gib=14,
+            ratio=8.0,
+        )
 
 
 def test_dram_limited_capacity_is_opt_in():

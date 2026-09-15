@@ -69,6 +69,7 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise_cache_la
 )
 from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.sparse_kv_offload_manager import (
     get_host_device_memory_usage_ratio,
+    get_host_memory_alignment_overhead_upper_bound,
 )
 from vllm_ascend.distributed.parallel_state import init_ascend_model_parallel
 from vllm_ascend.ops.triton.triton_utils import init_device_properties_triton
@@ -638,7 +639,22 @@ class NPUWorker(WorkerBase):
         configured_dram_size_bytes = (
             sparse_kv_offload_config.dram_size_per_dp_GB * (1 << 30)
         )
-        if needed_dram_size_bytes > configured_dram_size_bytes:
+        capacity_dram_size_bytes = configured_dram_size_bytes
+        alignment_overhead_bytes = 0
+        if (
+            sparse_kv_offload_config.dram_limited_capacity
+            and not keep_device_kv_cache
+        ):
+            alignment_overhead_bytes = (
+                get_host_memory_alignment_overhead_upper_bound(kv_cache_spec)
+            )
+            capacity_dram_size_bytes -= alignment_overhead_bytes
+            if capacity_dram_size_bytes <= 0:
+                raise ValueError(
+                    "Sparse KV offload host pool is no larger than its "
+                    f"alignment reserve ({GiB(alignment_overhead_bytes):.2f} GiB)."
+                )
+        if needed_dram_size_bytes > capacity_dram_size_bytes:
             if (
                 not sparse_kv_offload_config.dram_limited_capacity
                 or keep_device_kv_cache
@@ -658,14 +674,16 @@ class NPUWorker(WorkerBase):
             # rejects larger batches normally.
             available_memory = min(
                 available_memory,
-                int(configured_dram_size_bytes / host_device_memory_usage_ratio),
+                int(capacity_dram_size_bytes / host_device_memory_usage_ratio),
             )
             needed_dram_size_bytes = host_device_memory_usage_ratio * available_memory
             logger.warning_once(
                 "Sparse KV offload host pool limits usable device index cache "
-                "memory to %.2f GiB and host cache memory to %.2f GiB.",
+                "memory to %.2f GiB and logical host cache memory to %.2f GiB "
+                "after reserving %.2f GiB for per-layer alignment.",
                 GiB(available_memory),
                 GiB(needed_dram_size_bytes),
+                GiB(alignment_overhead_bytes),
                 scope="local",
             )
         if not keep_device_kv_cache:

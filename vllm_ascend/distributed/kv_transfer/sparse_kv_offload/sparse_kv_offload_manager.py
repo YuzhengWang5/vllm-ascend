@@ -44,6 +44,7 @@ OFFLOAD_TOPK_BUFFER_V_INDEX = 5
 
 
 _SUBSCRIBED_COMPUTE_STREAMS: set[object] = set()
+_CPU_CACHE_ALIGNMENT = 2 * 1024 * 1024
 
 
 def get_subscribed_compute_streams() -> set:
@@ -62,6 +63,24 @@ def get_host_device_memory_usage_ratio(kv_cache_specs: dict[str, KVCacheSpec]) -
 
     assert page_size_bytes_device > 0, "Case of no device kv cache is not considered."
     return page_size_bytes_host / page_size_bytes_device
+
+
+def get_host_memory_alignment_overhead_upper_bound(
+    kv_cache_specs: dict[str, KVCacheSpec],
+    alignment: int = _CPU_CACHE_ALIGNMENT,
+) -> int:
+    """Return a strict upper bound for per-layer host allocation padding.
+
+    Each host-resident attention layer is allocated as one raw buffer holding
+    separately aligned K and V views. The raw buffer needs one leading
+    alignment chunk and each view can add less than one chunk of tail padding,
+    so reserving three chunks per layer is sufficient for every tensor size.
+    """
+    num_offload_layers = sum(
+        bool(getattr(spec, "store_on_host", False))
+        for spec in kv_cache_specs.values()
+    )
+    return num_offload_layers * 3 * alignment
 
 
 def allocate_kv_offload_topk_buffer_pair(
@@ -117,9 +136,6 @@ def allocate_kv_offload_topk_profile_buffers(
         num_offload_layers,
     )
     return buffers
-
-
-_CPU_CACHE_ALIGNMENT = 2 * 1024 * 1024
 
 
 def empty_aligned_int8_cpu_tensors(
