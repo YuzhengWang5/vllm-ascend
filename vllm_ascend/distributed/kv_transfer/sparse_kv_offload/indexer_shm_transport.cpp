@@ -31,6 +31,9 @@ extern "C" void indexer_shm_decoder_exchange_do(
 extern "C" void indexer_shm_service_receive_do(
     void* stream, uint8_t* gva, uint64_t symmetric_size, uint32_t service_rank,
     uint8_t* request, uint32_t request_bytes);
+extern "C" void indexer_shm_service_peek_request_do(
+    void* stream, uint8_t* gva, uint64_t symmetric_size,
+    uint32_t service_rank, int32_t* control);
 extern "C" void indexer_shm_service_respond_do(
     void* stream, uint8_t* gva, uint64_t symmetric_size, uint32_t decoder_rank,
     uint32_t service_rank, uint8_t* response, uint32_t response_bytes);
@@ -208,6 +211,17 @@ void ServiceReceive(at::Tensor& request, int64_t gva, int64_t symmetric_size,
       static_cast<uint8_t*>(request.data_ptr()), request.numel());
 }
 
+void ServicePeekRequest(at::Tensor& control, int64_t gva,
+                        int64_t symmetric_size, int64_t service_rank) {
+  CheckNpuTensor(control, at::kInt, "control");
+  TORCH_CHECK(control.numel() >= 8,
+              "control must hold one 32-byte doorbell cache line");
+  auto stream = c10_npu::getCurrentNPUStream().stream();
+  indexer_shm_service_peek_request_do(
+      stream, reinterpret_cast<uint8_t*>(gva), symmetric_size, service_rank,
+      static_cast<int32_t*>(control.data_ptr()));
+}
+
 void ServiceRespond(const at::Tensor& response, int64_t gva,
                     int64_t symmetric_size, int64_t decoder_rank,
                     int64_t service_rank) {
@@ -311,6 +325,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
   module.def("tp_fanout_follower", &TpFanoutFollower);
   module.def("decoder_exchange", &DecoderExchange);
   module.def("service_receive", &ServiceReceive);
+  module.def("service_peek_request", &ServicePeekRequest);
   module.def("service_respond", &ServiceRespond);
   module.def("decoder_exchange_profiled", &DecoderExchangeProfiled);
   module.def("decoder_exchange_tensors_profiled",
