@@ -10,6 +10,6 @@
   "dram_pool_gib_per_dp": 48,
   "service_cache_blocks_per_dp": 4300,
   "service_batch_shapes": [4, 3, 2, 1],
-  "decoder_startup_prelude_shapes": [4, 3, 2],
-  "startup_note": "With this pinned vLLM image, the first B1 request is not a startup prelude. Passing B1 as a prelude consumed the first real B2 request with a B1 graph and caused an invalid GM access."
+  "decoder_startup_prelude_shapes": [],
+  "startup_note": "The pinned eager decoder reports API health before the remote service has completed any static prelude. Therefore the service must dispatch its first real request by request byte size; no static prelude graphs are queued."
 }

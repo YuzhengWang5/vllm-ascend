@@ -286,6 +286,7 @@ def serve(args: argparse.Namespace) -> None:
                 "device": args.device,
                 "layers": args.layers,
                 "batches": args.batches,
+                "prelude_batches": args.prelude_batches,
                 "request_bytes": {batch: requests[batch].buffer.numel() for batch in args.batches},
                 "data_request_bytes": {
                     batch: data_requests[batch].buffer.numel()
@@ -302,10 +303,10 @@ def serve(args: argparse.Namespace) -> None:
         flush=True,
     )
 
-    # Queue only the startup shapes passed by the experiment launcher.  They
-    # must match the decoder's actual warmup sequence exactly: a first real
-    # request with a different batch shape would otherwise be consumed by the
-    # wrong prelude graph.  Afterwards the dynamic loop handles every shape.
+    # If a deployment uses static startup replays, these shapes must match
+    # decoder requests exactly.  The eager GLM benchmark passes an empty list
+    # because API health precedes any request; its first request must enter the
+    # dynamic byte-size dispatch loop below.
     for batch in args.prelude_batches:
         for graph in graphs[batch]:
             graph.replay()
