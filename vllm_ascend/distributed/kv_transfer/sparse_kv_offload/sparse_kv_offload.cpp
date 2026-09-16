@@ -115,7 +115,8 @@ FORCE_INLINE int32_t next_lru_resident_epoch(int32_t* RESTRICT token_mark, int32
 }
 
 FORCE_INLINE void process_one_lru_resident_row(
-    const int row, const int32_t topk, const int32_t capacity, const int32_t max_token, const int64_t* RESTRICT req_ids,
+    const int row, const int32_t topk, const int32_t capacity, const int32_t forced_miss_count,
+    const int32_t max_token, const int64_t* RESTRICT req_ids,
     int64_t* RESTRICT last_req_ids, const int32_t* RESTRICT topk_indices, const int32_t* RESTRICT stable_prefix_lens,
     int32_t* RESTRICT slot_to_token, int32_t* RESTRICT lru_slots, int32_t* RESTRICT current_slots,
     int32_t* RESTRICT miss_count, int32_t* RESTRICT miss_tokens_out, int32_t* RESTRICT miss_slots_out,
@@ -162,6 +163,12 @@ FORCE_INLINE void process_one_lru_resident_row(
     int32_t token = slot_to_token_row[slot];
     // The speculative suffix may have been overwritten in the CPU KV pool.
     if (LIKELY(is_valid_lru_resident_token(token, max_token)) && UNLIKELY(token >= stable_prefix_len)) {
+      slot_to_token_row[slot] = -1;
+      token = -1;
+    }
+    if (LIKELY(is_valid_lru_resident_token(token, max_token)) && token_mark[token] == base &&
+        token_pos[token] < forced_miss_count) {
+      // Benchmark-only controlled reload of the selected Top-K positions.
       slot_to_token_row[slot] = -1;
       token = -1;
     }
@@ -220,8 +227,10 @@ HOT_FUNCTION void lru_resident_compact(uintptr_t req_ids_ptr, uintptr_t last_req
                                        uintptr_t token_mark_workspace_ptr, uintptr_t token_pos_workspace_ptr,
                                        uintptr_t slot_workspace_ptr, uintptr_t miss_position_workspace_ptr,
                                        uintptr_t epochs_ptr, int64_t num_reqs, int64_t topk, int64_t capacity,
-                                       int64_t max_token, int64_t workspace_threads, int64_t requested_threads) {
-  if (num_reqs <= 0 || topk <= 0 || capacity <= 0 || max_token <= 0) {
+                                       int64_t forced_miss_count, int64_t max_token, int64_t workspace_threads,
+                                       int64_t requested_threads) {
+  if (num_reqs <= 0 || topk <= 0 || capacity <= 0 || max_token <= 0 ||
+      forced_miss_count < 0 || forced_miss_count > topk) {
     return;
   }
 
@@ -250,7 +259,8 @@ HOT_FUNCTION void lru_resident_compact(uintptr_t req_ids_ptr, uintptr_t last_req
 
   if (active_threads == 1) {
     for (int row = 0; row < num_reqs_int; ++row) {
-      process_one_lru_resident_row(row, topk_int, capacity_int, max_token_int, req_ids, last_req_ids, topk_indices,
+      process_one_lru_resident_row(row, topk_int, capacity_int, static_cast<int32_t>(forced_miss_count),
+                                   max_token_int, req_ids, last_req_ids, topk_indices,
                                    stable_prefix_lens, slot_to_token, lru_slots, current_slots, miss_count, miss_tokens,
                                    miss_slots, token_mark_workspace, token_pos_workspace, slot_workspace,
                                    miss_position_workspace, epochs);
@@ -267,7 +277,8 @@ HOT_FUNCTION void lru_resident_compact(uintptr_t req_ids_ptr, uintptr_t last_req
     int32_t* RESTRICT miss_positions = miss_position_workspace + static_cast<int64_t>(thread_id) * topk_int;
     int32_t* RESTRICT epoch = epochs + thread_id;
     for (int row = thread_id; row < num_reqs_int; row += active_threads) {
-      process_one_lru_resident_row(row, topk_int, capacity_int, max_token_int, req_ids, last_req_ids, topk_indices,
+      process_one_lru_resident_row(row, topk_int, capacity_int, static_cast<int32_t>(forced_miss_count),
+                                   max_token_int, req_ids, last_req_ids, topk_indices,
                                    stable_prefix_lens, slot_to_token, lru_slots, current_slots, miss_count, miss_tokens,
                                    miss_slots, token_mark, token_pos, slots, miss_positions, epoch);
     }

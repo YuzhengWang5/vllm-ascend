@@ -345,6 +345,7 @@ class SparseKVOffloadManager:
         self.block_size = self._infer_group_block_sizes(self.kv_cache_config)
         self.topk_buffer_size = sparse_kv_offload_config.topk_buffer_size
         self.topk = sparse_kv_offload_config.topk
+        self.motivation_forced_miss_count = sparse_kv_offload_config.motivation_forced_miss_count
         self.motivation_baseline = sparse_kv_offload_config.motivation_baseline
         self.remote_indexer_share_within_tp = (
             sparse_kv_offload_config.remote_indexer_share_within_tp
@@ -1431,6 +1432,7 @@ class SparseKVOffloadManager:
             num_reqs,
             self.topk,
             self.topk_buffer_size,
+            self.motivation_forced_miss_count,
             self.max_model_len,
             self.lru_workspace_threads,
             self.lru_workspace_threads,

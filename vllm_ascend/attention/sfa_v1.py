@@ -645,10 +645,15 @@ class AscendSFAImpl(MLAAttentionImpl):
         # applies only to layers that own an indexer cache.
         self.enable_sparse_sfa_c8 = ascend_config.enable_sparse_sfa_c8
         self.enable_sparse_li_c8 = self.has_indexer and ascend_config.is_sparse_li_c8_layer(self.indexer.k_cache.prefix)
-        if self.remote_indexer_enabled and not self.enable_sparse_li_c8:
+        if (
+            self.remote_indexer_enabled
+            and not self.enable_sparse_li_c8
+            and ascend_config.sparse_kv_offload_config.remote_indexer_transport != "shm"
+        ):
             raise ValueError(
-                "Remote indexer v0 requires additional_config.enable_sparse_li_c8=True"
+                "The raw remote indexer requires additional_config.enable_sparse_li_c8=True"
             )
+        self._remote_bf16_scale_buffers: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
         if self.enable_sparse_sfa_c8 or self.enable_sparse_li_c8:
             if get_ascend_device_type() == AscendDeviceType.A5:
                 self.c8_k_cache_dtype = torch.float8_e4m3fn
@@ -1545,17 +1550,28 @@ class AscendSFAImpl(MLAAttentionImpl):
             q_li_scale = q_li_scale.to(self.c8_k_scale_cache_dtype)  # [b*s,]
 
         if self.remote_indexer_enabled:
-            if q_li_scale is None or new_k is None or new_k_scale is None:
-                raise RuntimeError(
-                    "Remote indexer v0 requires quantized query/key scales"
-                )
+            if new_k is None:
+                raise RuntimeError("Remote indexer requires a new index key")
             if slot_mapping is None:
                 raise RuntimeError("Remote indexer v0 requires slot_mapping")
+            if q_li_scale is None:
+                if q_li.dtype != torch.bfloat16 or new_k.dtype != torch.bfloat16:
+                    raise RuntimeError("BF16 remote indexer requires BF16 query and key")
+                buffers = self._remote_bf16_scale_buffers.get(q_li.shape[0])
+                if buffers is None:
+                    buffers = (
+                        torch.zeros(q_li.shape[:-1], dtype=torch.float16, device=q_li.device),
+                        torch.zeros((q_li.shape[0], 1), dtype=torch.float16, device=q_li.device),
+                    )
+                    self._remote_bf16_scale_buffers[q_li.shape[0]] = buffers
+                q_li_scale, new_k_scale = buffers
+            elif new_k_scale is None:
+                raise RuntimeError("C8 remote indexer requires the key scale")
             manager = get_sparse_kv_offload_manager()
             return manager.remote_indexer_select(
                 layer_name=self.layer_name or "",
-                q=q_li.view(q_li_shape_ori),
-                q_scale=q_li_scale.view(q_li_shape_ori[:-1]),
+                q=q_li.view(q_li_shape_ori or q_li.shape),
+                q_scale=q_li_scale.view(q_li_shape_ori[:-1] if q_li_shape_ori else q_li.shape[:-1]),
                 weights=weights,
                 new_k=new_k,
                 new_k_scale=new_k_scale,

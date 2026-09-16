@@ -1050,6 +1050,9 @@ class SparseKVOffloadConfig:
         self.motivation_force_oracle_trace = bool(
             user_config.get("motivation_force_oracle_trace", False)
         )
+        self.motivation_forced_miss_count = int(
+            user_config.get("motivation_forced_miss_count", 0)
+        )
         self.remote_indexer_host = str(
             user_config.get("remote_indexer_host", "")
         )
@@ -1209,6 +1212,14 @@ class SparseKVOffloadConfig:
             raise ValueError("Sparse KV offload doesn't support model_runner_v2 now.")
 
         self.topk = vllm_config.model_config.hf_text_config.index_topk
+        if not 0 <= self.motivation_forced_miss_count <= self.topk:
+            raise ValueError("motivation_forced_miss_count must be in [0, topk]")
+        if self.motivation_forced_miss_count and (
+            not self.motivation_force_oracle_trace or self.remote_indexer_enabled
+        ):
+            raise ValueError(
+                "motivation_forced_miss_count requires local motivation_force_oracle_trace"
+            )
         if self.topk_buffer_size <= 0:
             raise ValueError("sparse_kv_offload_config.topk_buffer_size must be positive")
         if self.topk_buffer_size < self.topk:
