@@ -456,7 +456,12 @@ class ShmRemoteIndexerClient:
                 for name in ("q", "q_scale", "weights", "new_k", "new_k_scale")
             }
         if self.direct_pack:
-            direct_tensors = list(request_tensors.values())
+            # BF16 indexer weights can be a strided view when a DP rank has
+            # multiple live requests.  The direct AIV transport requires each
+            # segment to be contiguous; C8 used to obtain that implicitly via
+            # the dtype conversion above.  Keep the same requirement explicit
+            # for both dtypes and every request shape.
+            direct_tensors = [tensor.contiguous() for tensor in request_tensors.values()]
             if len(direct_tensors) == 5:
                 padding = self._direct_pack_padding.get(q.device)
                 if padding is None:
