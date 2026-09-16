@@ -302,10 +302,10 @@ def serve(args: argparse.Namespace) -> None:
         flush=True,
     )
 
-    # vLLM's FULL_DECODE_ONLY startup executes one model pass for each capture
-    # shape, in descending capture-size order.  Queue the matching service
-    # graphs before entering the steady B8 loop.  This keeps dispatch entirely
-    # device-side on the hot path; no Python/CPU payload inspection is needed.
+    # Queue only the startup shapes passed by the experiment launcher.  They
+    # must match the decoder's actual warmup sequence exactly: a first real
+    # request with a different batch shape would otherwise be consumed by the
+    # wrong prelude graph.  Afterwards the dynamic loop handles every shape.
     for batch in args.prelude_batches:
         for graph in graphs[batch]:
             graph.replay()

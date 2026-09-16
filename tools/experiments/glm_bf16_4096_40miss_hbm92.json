@@ -1,0 +1,15 @@
+{
+  "platform": "CloudMatrix 384 A3",
+  "topology": "TP1/DP16/EP16 decoder plus 16 dedicated remote indexer services",
+  "remote_host": "7.150.13.62",
+  "index_dtype": "bf16",
+  "hot_buffer_tokens_per_request": 4096,
+  "topk": 2048,
+  "forced_misses_per_topk": 819,
+  "hbm_utilization": 0.92,
+  "dram_pool_gib_per_dp": 48,
+  "service_cache_blocks_per_dp": 4300,
+  "service_batch_shapes": [4, 3, 2, 1],
+  "decoder_startup_prelude_shapes": [4, 3, 2],
+  "startup_note": "With this pinned vLLM image, the first B1 request is not a startup prelude. Passing B1 as a prelude consumed the first real B2 request with a B1 graph and caused an invalid GM access."
+}
