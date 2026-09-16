@@ -1210,11 +1210,22 @@ class AscendSFAImpl(MLAAttentionImpl):
             .split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
         )
 
-        # Convert from (B, N, P) to (N, B, P)
+        if hasattr(torch_npu, "npu_transpose_batchmatmul"):
+            # torch.bmm on the NZ UK weight selects the legacy aclop
+            # BatchMatMul, which cannot be captured by ACLGraph.  This aclnn
+            # variant preserves the same (B, N, L) result without globally
+            # disabling NZ for W4A8 weights.
+            ql_nope = torch_npu.npu_transpose_batchmatmul(
+                q_nope,
+                self.W_UK_T,
+                perm_x1=(1, 0, 2),
+                perm_y=(1, 0, 2),
+            )
+            return ql_nope, q_pe
+
+        # Older torch_npu releases retain the eager-only fallback.
         q_nope = q_nope.transpose(0, 1)
-        # Multiply (N, B, P) x (N, P, L) -> (N, B, L)
         ql_nope = torch.bmm(q_nope, self.W_UK_T)
-        # Convert from (N, B, L) to (B, N, L)
         return ql_nope.transpose(0, 1), q_pe
 
     def _v_up_proj(self, x):

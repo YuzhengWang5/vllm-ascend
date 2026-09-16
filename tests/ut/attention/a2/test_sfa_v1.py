@@ -1198,3 +1198,31 @@ class TestAscendSFAImpl(TestBase):
         self.assertIs(impl._quant_type, AscendW8A8MXFP8DynamicLinearMethod)
 
     # (MLAPO runtime path requires NPU hardware; covered by integration tests.)
+
+
+class TestSFAUKGraphProjection(TestBase):
+    @patch("vllm_ascend.attention.sfa_v1.torch_npu.npu_transpose_batchmatmul")
+    def test_q_proj_uses_graph_capturable_batchmatmul(self, mock_batchmatmul):
+        impl = AscendSFAImpl.__new__(AscendSFAImpl)
+        batch, heads, nope, rope, rank = 4, 2, 64, 32, 128
+        query = torch.randn(batch, heads, nope + rope)
+        weight = torch.randn(heads, nope, rank)
+        impl.local_num_heads = heads
+        impl.qk_head_dim = nope + rope
+        impl.qk_nope_head_dim = nope
+        impl.qk_rope_head_dim = rope
+        impl.q_proj = MagicMock(return_value=(query,))
+        impl.W_UK_T = weight
+
+        mock_batchmatmul.side_effect = lambda x, y, **kwargs: torch.bmm(
+            x.transpose(0, 1), y
+        ).transpose(0, 1)
+        ql_nope, q_pe = impl._q_proj_and_k_up_proj(query)
+        expected = torch.bmm(query[:, :, :nope].transpose(0, 1), weight).transpose(0, 1)
+
+        torch.testing.assert_close(ql_nope, expected)
+        torch.testing.assert_close(q_pe, query[:, :, nope:])
+        self.assertEqual(
+            mock_batchmatmul.call_args.kwargs,
+            {"perm_x1": (1, 0, 2), "perm_y": (1, 0, 2)},
+        )
