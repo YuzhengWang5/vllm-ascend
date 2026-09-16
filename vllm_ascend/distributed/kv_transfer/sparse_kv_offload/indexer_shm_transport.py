@@ -170,6 +170,7 @@ class IndexerShmTransport:
         resident_sources: torch.Tensor,
         response: torch.Tensor,
         block_size: int,
+        forced_miss_count: int = 0,
     ) -> None:
         self._extension.service_resident_update(
             topk,
@@ -178,6 +179,7 @@ class IndexerShmTransport:
             resident_sources,
             response,
             block_size,
+            forced_miss_count,
         )
 
     def decoder_resident_descriptors(
@@ -428,12 +430,12 @@ class ShmRemoteIndexerClient:
         capturing: bool,
     ) -> torch.Tensor:
         del capturing
-        if q.dtype != torch.int8 or new_k.dtype != torch.int8:
-            raise ValueError("SHM remote indexer requires the C8 indexer path")
+        if q.dtype not in (torch.int8, torch.bfloat16) or new_k.dtype != q.dtype:
+            raise ValueError("SHM remote indexer requires matching C8 or BF16 query/key")
         tensors = {
             "q": q,
             "q_scale": q_scale,
-            "weights": weights.to(torch.float16),
+            "weights": weights.to(torch.float16) if q.dtype == torch.int8 else weights,
             "new_k": new_k,
             "new_k_scale": new_k_scale,
             "slot_mapping": slot_mapping,
@@ -454,7 +456,9 @@ class ShmRemoteIndexerClient:
                 for name in ("q", "q_scale", "weights", "new_k", "new_k_scale")
             }
         if self.direct_pack:
-            direct_tensors = list(request_tensors.values())
+            # BF16 weights can be a strided view at multi-request batch sizes.
+            # The direct AIV transport requires contiguous segments.
+            direct_tensors = [tensor.contiguous() for tensor in request_tensors.values()]
             if len(direct_tensors) == 5:
                 padding = self._direct_pack_padding.get(q.device)
                 if padding is None:

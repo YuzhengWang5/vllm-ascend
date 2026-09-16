@@ -58,7 +58,7 @@ __aicore__ inline void ServiceResidentUpdate(
     uint64_t count, GM_ADDR topk_addr, GM_ADDR block_table_addr,
     GM_ADDR slot_mapping_addr, GM_ADDR resident_sources_addr,
     GM_ADDR response_addr, uint32_t topk_size, uint32_t block_table_cols,
-    uint32_t block_size) {
+    uint32_t block_size, uint32_t forced_miss_count) {
   AscendC::GlobalTensor<int32_t> topk;
   AscendC::GlobalTensor<int32_t> block_table;
   AscendC::GlobalTensor<int32_t> slot_mapping;
@@ -118,7 +118,8 @@ __aicore__ inline void ServiceResidentUpdate(
       } else {
         response_local.SetValue(
             position,
-            (resident_local.GetValue(position) != physical ||
+            (position < forced_miss_count ||
+             resident_local.GetValue(position) != physical ||
              physical == current_slot)
                 ? physical
                 : kResidentHit);
@@ -487,10 +488,11 @@ indexer_shm_initialize_control(GM_ADDR gva_addr, uint64_t symmetric_size,
 indexer_shm_service_resident_update(
     GM_ADDR topk_addr, GM_ADDR block_table_addr, GM_ADDR slot_mapping_addr,
     GM_ADDR resident_sources_addr, GM_ADDR response_addr, uint64_t count,
-    uint32_t topk_size, uint32_t block_table_cols, uint32_t block_size) {
+    uint32_t topk_size, uint32_t block_table_cols, uint32_t block_size,
+    uint32_t forced_miss_count) {
   ServiceResidentUpdate(count, topk_addr, block_table_addr, slot_mapping_addr,
                         resident_sources_addr, response_addr, topk_size,
-                        block_table_cols, block_size);
+                        block_table_cols, block_size, forced_miss_count);
 }
 
 [[bisheng::core_ratio(0, 1)]] __global__ __aicore__ void
@@ -804,14 +806,14 @@ extern "C" void indexer_shm_service_resident_update_do(
     void* stream, int32_t* topk, int32_t* block_table,
     int32_t* slot_mapping, int32_t* resident_sources, int32_t* response,
     uint64_t count, uint32_t topk_size, uint32_t block_table_cols,
-    uint32_t block_size) {
+    uint32_t block_size, uint32_t forced_miss_count) {
   indexer_shm_service_resident_update<<<kResidentBlocks, nullptr, stream>>>(
       reinterpret_cast<uint8_t*>(topk),
       reinterpret_cast<uint8_t*>(block_table),
       reinterpret_cast<uint8_t*>(slot_mapping),
       reinterpret_cast<uint8_t*>(resident_sources),
       reinterpret_cast<uint8_t*>(response), count, topk_size,
-      block_table_cols, block_size);
+      block_table_cols, block_size, forced_miss_count);
 }
 
 extern "C" void indexer_shm_decoder_resident_descriptors_do(

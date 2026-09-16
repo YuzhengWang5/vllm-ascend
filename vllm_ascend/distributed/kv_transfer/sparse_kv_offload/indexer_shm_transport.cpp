@@ -10,7 +10,7 @@ extern "C" void indexer_shm_service_resident_update_do(
     void* stream, int32_t* topk, int32_t* block_table,
     int32_t* slot_mapping, int32_t* resident_sources, int32_t* response,
     uint64_t count, uint32_t topk_size, uint32_t block_table_cols,
-    uint32_t block_size);
+    uint32_t block_size, uint32_t forced_miss_count);
 extern "C" void indexer_shm_decoder_resident_descriptors_do(
     void* stream, int32_t* encoded_sources, int64_t* gvas, int64_t* addrs,
     int32_t* sizes, int32_t* descriptor_count, int32_t* current_slots,
@@ -83,7 +83,8 @@ void ServiceResidentUpdate(const at::Tensor& topk,
                            const at::Tensor& block_table,
                            const at::Tensor& slot_mapping,
                            at::Tensor& resident_sources,
-                           at::Tensor& response, int64_t block_size) {
+                           at::Tensor& response, int64_t block_size,
+                           int64_t forced_miss_count) {
   CheckNpuTensor(topk, at::kInt, "topk");
   CheckNpuTensor(block_table, at::kInt, "block_table");
   CheckNpuTensor(slot_mapping, at::kInt, "slot_mapping");
@@ -102,6 +103,8 @@ void ServiceResidentUpdate(const at::Tensor& topk,
   TORCH_CHECK(block_table.size(0) == rows,
               "block_table rows must equal topk rows");
   TORCH_CHECK(block_size > 0, "block_size must be positive");
+  TORCH_CHECK(forced_miss_count >= 0 && forced_miss_count <= topk_size,
+              "forced_miss_count must be in [0, topk_size]");
   auto stream = c10_npu::getCurrentNPUStream().stream();
   indexer_shm_service_resident_update_do(
       stream, static_cast<int32_t*>(topk.data_ptr()),
@@ -109,7 +112,7 @@ void ServiceResidentUpdate(const at::Tensor& topk,
       static_cast<int32_t*>(slot_mapping.data_ptr()),
       static_cast<int32_t*>(resident_sources.data_ptr()),
       static_cast<int32_t*>(response.data_ptr()), topk.numel(), topk_size,
-      block_table.size(1), block_size);
+      block_table.size(1), block_size, forced_miss_count);
 }
 
 void DecoderResidentDescriptors(
