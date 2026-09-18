@@ -43,6 +43,8 @@ fi
 npu-smi info
 export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15
 export PYTHONPATH="${source_dir}${PYTHONPATH:+:${PYTHONPATH}}"
+export CC=/usr/bin/gcc
+export CXX=/usr/bin/g++
 export MF_HOME=/usr/local/python3.12.13/lib/python3.12/site-packages/memfabric_hybrid
 custom_op_root=${source_dir}/vllm_ascend/_cann_ops_custom/vendors/custom_transformer
 export ASCEND_CUSTOM_OPP_PATH="${custom_op_root}${ASCEND_CUSTOM_OPP_PATH:+:${ASCEND_CUSTOM_OPP_PATH}}"

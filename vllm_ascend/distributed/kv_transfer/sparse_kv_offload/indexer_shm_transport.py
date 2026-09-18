@@ -34,8 +34,8 @@ def _load_extension():
         )
     ascend_home = Path(os.environ.get("ASCEND_HOME_PATH", "/usr/local/Ascend/ascend-toolkit/latest"))
     torch_npu_root = Path(torch_npu.__file__).resolve().parent
-    os.environ["CC"] = "clang"
-    os.environ["CXX"] = "clang++"
+    os.environ.setdefault("CC", "clang")
+    os.environ.setdefault("CXX", "clang++")
     return load(
         name="indexer_shm_transport",
         sources=[str(source_dir / "indexer_shm_transport.cpp")],

@@ -45,6 +45,7 @@ ssh "${ssh_opts[@]}" "${remote_host}" 'npu-smi info'
 
 ssh "${ssh_opts[@]}" "${remote_host}" \
     "docker exec -e ASCEND_RT_VISIBLE_DEVICES=0 \
+       -e CC=/usr/bin/gcc -e CXX=/usr/bin/g++ \
        -e PYTHONPATH='${remote_source}' \
        -e MF_HOME=/usr/local/python3.12.13/lib/python3.12/site-packages/memfabric_hybrid \
        -e TORCH_EXTENSIONS_DIR=/tmp/glm5-bf16-torch-ext \
@@ -59,6 +60,7 @@ for ((rank=0; rank<dp_size; rank++)); do
     ssh "${ssh_opts[@]}" "${remote_host}" \
         "docker exec -d \
           -e ASCEND_RT_VISIBLE_DEVICES='${service_device}' \
+          -e CC=/usr/bin/gcc -e CXX=/usr/bin/g++ \
           -e PYTHONPATH='${remote_source}' \
           -e MF_HOME=/usr/local/python3.12.13/lib/python3.12/site-packages/memfabric_hybrid \
           -e TORCH_EXTENSIONS_DIR=/tmp/glm5-bf16-torch-ext \
