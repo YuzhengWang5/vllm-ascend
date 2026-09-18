@@ -27,6 +27,21 @@ def parse_npu_smi(output: str) -> dict[int, int]:
     return usage
 
 
+def parse_processes(output: str) -> list[dict]:
+    processes = []
+    for line in output.splitlines():
+        fields = line.split("|")
+        if len(fields) < 6 or not fields[2].strip().isdigit():
+            continue
+        identifiers = fields[1].split()
+        if len(identifiers) != 2 or not all(value.isdigit() for value in identifiers):
+            continue
+        processes.append({"die": int(identifiers[1]),
+                          "pid": int(fields[2].strip()),
+                          "name": fields[3].strip()})
+    return processes
+
+
 def active_marker(path: Path) -> dict | None:
     try:
         return json.loads(path.read_text())
@@ -53,12 +68,14 @@ def main():
             if result.returncode != 0 or after != before:
                 continue
             usage = parse_npu_smi(result.stdout)
+            processes = parse_processes(result.stdout)
             if len(usage) != 16 or set(usage) != set(range(16)):
                 raise RuntimeError(f"expected A3 die 0..15; saw {sorted(usage)}")
             stream.write(json.dumps({
                 "stage": before["stage"], "batch": before["batch"],
                 "monotonic_start": started, "monotonic_end": ended,
                 "aicore_percent_by_die": usage,
+                "processes": processes,
             }) + "\n")
             stream.flush()
 

@@ -46,6 +46,13 @@ def main():
             # fully collected while the active marker contained this stage.
             trimmed = points[1:-1]
             assert len(trimmed) >= 4, (stage, batch, len(trimmed))
+            for sample in trimmed:
+                # The benchmark runs one rank on every die. Any extra owner
+                # makes device-level usage attribution ambiguous.
+                owners = sample["processes"]
+                assert len(owners) == 16 and {p["die"] for p in owners} == set(range(16)), (
+                    stage, batch, owners
+                )
             per_sample_mean = [statistics.mean(float(s["aicore_percent_by_die"][str(i)])
                                                for i in range(16)) for s in trimmed]
             die_means = [statistics.mean(float(s["aicore_percent_by_die"][str(i)])
