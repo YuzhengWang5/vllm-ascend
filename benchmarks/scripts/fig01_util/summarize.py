@@ -15,11 +15,21 @@ BATCHES = (4, 8, 12, 16, 24, 32, 48, 64, 96, 128)
 
 
 def records(path: Path):
-    for line in path.read_text().splitlines():
+    # torchrun merges stdout from 16 ranks and can concatenate complete JSON
+    # objects on one line. Scan the stream instead of assuming one per line.
+    data = path.read_text()
+    decoder = json.JSONDecoder()
+    index = 0
+    while True:
+        start = data.find("{", index)
+        if start < 0:
+            break
         try:
-            value = json.loads(line)
+            value, consumed = decoder.raw_decode(data[start:])
         except ValueError:
+            index = start + 1
             continue  # torchrun and CANN emit non-JSON diagnostic lines.
+        index = start + consumed
         if isinstance(value, dict):
             yield value
 
