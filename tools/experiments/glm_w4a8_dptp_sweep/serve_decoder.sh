@@ -13,6 +13,7 @@ hbm_util=${GLM_HBM_UTIL:-0.92}
 remote_host=${GLM_REMOTE_HOST:-7.150.13.62}
 remote_store_port=${GLM_REMOTE_STORE_PORT:-29740}
 remote_profile_device=${GLM_REMOTE_PROFILE_DEVICE:-0}
+profiler_dir=${GLM_PROFILER_DIR:-}
 if [[ ${remote_profile_device} != 0 && ${remote_profile_device} != 1 ]]; then
     echo "GLM_REMOTE_PROFILE_DEVICE must be 0 or 1" >&2
     exit 2
@@ -130,6 +131,16 @@ block_args=()
 if [[ ${variant} == iaas ]]; then
     block_args=(--num-gpu-blocks-override "${iaas_blocks}")
 fi
+profiler_args=()
+if [[ -n ${profiler_dir} ]]; then
+    mkdir -p "${profiler_dir}"
+    profiler_args=(--profiler-config "$(/usr/local/python3.12.13/bin/python3 - "${profiler_dir}" <<'PY'
+import json
+import sys
+print(json.dumps({"profiler": "torch", "torch_profiler_dir": sys.argv[1]}))
+PY
+)")
+fi
 
 capture_sizes=$(/usr/local/python3.12.13/bin/python3 - "${max_local_batch}" "${bucket_spec}" <<'PY'
 import json
@@ -158,4 +169,4 @@ exec /usr/local/python3.12.13/bin/vllm serve "${model}" \
   --kv-transfer-config "${kv_transfer_config}" \
   --reasoning-parser glm45 \
   --compilation-config "${capture_sizes}" \
-  "${block_args[@]}"
+  "${block_args[@]}" "${profiler_args[@]}"

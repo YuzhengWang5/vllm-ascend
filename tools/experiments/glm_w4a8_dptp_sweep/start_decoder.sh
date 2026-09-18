@@ -13,6 +13,7 @@ hbm_util=${GLM_HBM_UTIL:-0.92}
 remote_host=${GLM_REMOTE_HOST:-7.150.13.62}
 remote_store_port=${GLM_REMOTE_STORE_PORT:-29740}
 remote_profile_device=${GLM_REMOTE_PROFILE_DEVICE:-0}
+profiler_dir=${GLM_PROFILER_DIR:-}
 case "${variant}" in
     iaas|baseline1) ;;
     *) echo "unsupported variant: ${variant}" >&2; exit 2 ;;
@@ -34,6 +35,7 @@ docker exec -d \
     -e GLM_REMOTE_HOST="${remote_host}" \
     -e GLM_REMOTE_STORE_PORT="${remote_store_port}" \
     -e GLM_REMOTE_PROFILE_DEVICE="${remote_profile_device}" \
+    -e GLM_PROFILER_DIR="${profiler_dir}" \
     -e GLM_RUN_DIR="/workspace/exps/20260919_012520_glm-w4a8-dptp/runs/20260919_012520_dp_tp_sweep" \
     "${container}" bash -lc \
     "source /usr/local/Ascend/cann-9.1.0/set_env.sh; exec bash /workspace/exps/20260919_012520_glm-w4a8-dptp/runs/20260919_012520_dp_tp_sweep/scripts/serve_decoder.sh '${variant}' '${attempt_tag}' > '/workspace/exps/20260919_012520_glm-w4a8-dptp/runs/20260919_012520_dp_tp_sweep/logs/${variant}_${attempt_tag}_server.log' 2>&1"
