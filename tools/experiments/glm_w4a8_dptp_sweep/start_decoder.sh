@@ -10,6 +10,8 @@ buckets=${GLM_BUCKETS:-}
 dram_gib_per_dp=${GLM_DRAM_GIB_PER_DP:?set GLM_DRAM_GIB_PER_DP}
 iaas_blocks=${GLM_IAAS_BLOCKS:?set GLM_IAAS_BLOCKS}
 hbm_util=${GLM_HBM_UTIL:-0.92}
+remote_host=${GLM_REMOTE_HOST:-7.150.13.62}
+remote_store_port=${GLM_REMOTE_STORE_PORT:-29740}
 case "${variant}" in
     iaas|baseline1) ;;
     *) echo "unsupported variant: ${variant}" >&2; exit 2 ;;
@@ -28,6 +30,8 @@ docker exec -d \
     -e GLM_DRAM_GIB_PER_DP="${dram_gib_per_dp}" \
     -e GLM_IAAS_BLOCKS="${iaas_blocks}" \
     -e GLM_HBM_UTIL="${hbm_util}" \
+    -e GLM_REMOTE_HOST="${remote_host}" \
+    -e GLM_REMOTE_STORE_PORT="${remote_store_port}" \
     -e GLM_RUN_DIR="/workspace/exps/20260919_012520_glm-w4a8-dptp/runs/20260919_012520_dp_tp_sweep" \
     "${container}" bash -lc \
     "source /usr/local/Ascend/cann-9.1.0/set_env.sh; exec bash /workspace/exps/20260919_012520_glm-w4a8-dptp/runs/20260919_012520_dp_tp_sweep/scripts/serve_decoder.sh '${variant}' '${attempt_tag}' > '/workspace/exps/20260919_012520_glm-w4a8-dptp/runs/20260919_012520_dp_tp_sweep/logs/${variant}_${attempt_tag}_server.log' 2>&1"
