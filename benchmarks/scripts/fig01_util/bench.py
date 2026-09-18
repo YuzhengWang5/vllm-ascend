@@ -78,7 +78,8 @@ def make_indexer_graph(batch: int, calls: int = 8):
                                 query_scale, qlens, klens, block_table)
 
 
-def make_dense_graph(batch: int, prefix: int, calls: int = 8):
+def make_dense_graph(batch: int, prefix: int, calls: int = 8,
+                     heads: int = HEADS, comm_group=None):
     """The production MLA decode FIA v2 path, with BF16 paged latent KV."""
     blocks_per_row = prefix // BLOCK
     blocks = batch * blocks_per_row
@@ -86,9 +87,9 @@ def make_dense_graph(batch: int, prefix: int, calls: int = 8):
     # FIA v2 page layout is [physical block, KV heads, block size, dim].
     key = torch.randn((blocks, 1, BLOCK, LATENT), dtype=torch.bfloat16, device="npu")
     key_rope = torch.randn((blocks, 1, BLOCK, ROPE), dtype=torch.bfloat16, device="npu")
-    queries = [torch.randn((batch, HEADS, 1, LATENT), dtype=torch.bfloat16, device="npu")
+    queries = [torch.randn((batch, heads, 1, LATENT), dtype=torch.bfloat16, device="npu")
                for _ in range(calls)]
-    query_ropes = [torch.randn((batch, HEADS, 1, ROPE), dtype=torch.bfloat16, device="npu")
+    query_ropes = [torch.randn((batch, heads, 1, ROPE), dtype=torch.bfloat16, device="npu")
                    for _ in range(calls)]
     graph = torch.npu.NPUGraph()
     outputs = []
@@ -96,7 +97,7 @@ def make_dense_graph(batch: int, prefix: int, calls: int = 8):
         for query, query_rope in zip(queries, query_ropes):
             out, _ = torch_npu.npu_fused_infer_attention_score_v2(
                 query, key, key, query_rope=query_rope, key_rope=key_rope,
-                num_query_heads=HEADS, num_key_value_heads=1,
+                num_query_heads=heads, num_key_value_heads=1,
                 input_layout="BNSD_NBSD", atten_mask=None, sparse_mode=0,
                 softmax_scale=(LATENT + ROPE) ** -0.5,
                 block_table=block_table, block_size=BLOCK,
@@ -104,6 +105,9 @@ def make_dense_graph(batch: int, prefix: int, calls: int = 8):
                 actual_seq_qlen=None, return_softmax_lse=False,
             )
             outputs.append(out)
+            if comm_group is not None:
+                payload = out.reshape(-1)[:batch * routed.HIDDEN]
+                dist.all_reduce(payload, group=comm_group)
     return graph, outputs[-1], (key, key_rope, queries, query_ropes, outputs, block_table)
 
 
@@ -119,18 +123,23 @@ def _init_moe(rank: int):
     return tp_group, mc2_group_name, routed.make_weights(1)
 
 
-def _make_graph(stage: str, batch: int, rank: int, moe_state):
+def _make_graph(stage: str, batch: int, rank: int, mode: str, moe_state, tp_group):
+    heads = 128 if mode == "single" else 16
+    comm_group = tp_group if mode == "tp8_comm" else None
     if stage == "indexer":
         graph, output, refs = make_indexer_graph(batch)
         kind = "indexer"
     elif stage == "sparse":
-        graph, output, refs, _ = stages.make_sfa_graph(batch, 8)
+        graph, output, refs, _ = stages.make_sfa_graph(batch, 8, heads=heads,
+                                                       comm_group=comm_group)
         kind = "finite"
     elif stage == "dense32":
-        graph, output, refs = make_dense_graph(batch, 32768)
+        graph, output, refs = make_dense_graph(batch, 32768, heads=heads,
+                                               comm_group=comm_group)
         kind = "finite"
     elif stage == "dense64":
-        graph, output, refs = make_dense_graph(batch, 65536)
+        graph, output, refs = make_dense_graph(batch, 65536, heads=heads,
+                                               comm_group=comm_group)
         kind = "finite"
     else:
         tp_group, mc2_group_name, weights = moe_state
@@ -163,7 +172,9 @@ def _verify(stage: str, batch: int, rank: int, output, refs, kind: str):
 
 
 def run_point(args, batch: int, rank: int, moe_state, marker: Path):
-    graph, output, refs, kind = _make_graph(args.stage, batch, rank, moe_state)
+    tp_group = args.tp_group
+    graph, output, refs, kind = _make_graph(args.stage, batch, rank,
+                                            args.mode, moe_state, tp_group)
     for _ in range(args.warmup):
         graph.replay()
     torch.npu.synchronize()
@@ -184,7 +195,8 @@ def run_point(args, batch: int, rank: int, moe_state, marker: Path):
     dist.barrier()
 
     if rank == 0:
-        _mark(marker, {"stage": args.stage, "batch": batch, "state": "active"})
+        _mark(marker, {"stage": args.stage, "batch": batch,
+                       "mode": args.mode, "state": "active"})
     dist.barrier()
     start = torch.npu.Event(enable_timing=True)
     stop = torch.npu.Event(enable_timing=True)
@@ -203,6 +215,7 @@ def run_point(args, batch: int, rank: int, moe_state, marker: Path):
     device_ms = start.elapsed_time(stop)
     record = {
         "stage": args.stage, "batch": batch, "rank": rank,
+        "mode": args.mode,
         "status": "pass", "graph_replays": target_replays,
         "pilot_ms_per_graph": local_graph_ms,
         "device_ms_total": device_ms,
@@ -219,6 +232,8 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--stage", required=True,
                         choices=("indexer", "sparse", "moe", "dense32", "dense64"))
+    parser.add_argument("--mode", default="tp8_no_comm",
+                        choices=("single", "tp8_no_comm", "tp8_comm"))
     parser.add_argument("--batches", nargs="+", type=int, default=BATCHES)
     parser.add_argument("--marker", required=True)
     parser.add_argument("--seconds", type=float, default=20.0)
@@ -230,10 +245,17 @@ def main():
     local_rank = int(os.environ["LOCAL_RANK"])
     torch.npu.set_device(local_rank)
     dist.init_process_group(backend="hccl")
-    assert dist.get_world_size() == 16
+    assert dist.get_world_size() == (1 if args.mode == "single" else 16)
+    assert args.mode == "tp8_no_comm" or args.stage in {"sparse", "dense32", "dense64"}
     torch_npu.npu.config.allow_internal_format = True
     enable_custom_op()
     init_device_properties_triton()
+    if args.mode == "tp8_comm":
+        tp_group0 = dist.new_group(list(range(0, routed.TP)), backend="hccl")
+        tp_group1 = dist.new_group(list(range(routed.TP, 2 * routed.TP)), backend="hccl")
+        args.tp_group = tp_group0 if rank < routed.TP else tp_group1
+    else:
+        args.tp_group = None
     moe_state = _init_moe(rank) if args.stage == "moe" else None
     marker = Path(args.marker)
     for batch in args.batches:

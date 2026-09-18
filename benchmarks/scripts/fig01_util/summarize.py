@@ -39,7 +39,8 @@ def main():
             assert {r["rank"] for r in rank_runs} == set(range(16)), (stage, batch)
             replays = {r["graph_replays"] for r in rank_runs}
             assert len(replays) == 1, (stage, batch, replays)
-            points = [s for s in samples if s["stage"] == stage and s["batch"] == batch]
+            points = [s for s in samples if s["stage"] == stage and s["batch"] == batch
+                      and s.get("mode") == "tp8_no_comm"]
             assert len(points) >= 6, (stage, batch, len(points))
             points.sort(key=lambda s: s["monotonic_start"])
             # Ignore one sample at each transition. Each retained sample was

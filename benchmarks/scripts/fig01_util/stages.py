@@ -32,17 +32,17 @@ EXPERTS = 16
 LAYERS = {"sfa": 61, "expert_balanced": 58, "expert_per_expert": 58}
 
 
-def make_sfa_graph(batch: int, k: int):
+def make_sfa_graph(batch: int, k: int, heads: int = HEADS, comm_group=None):
     pages_per_row = TOPK // BLOCK
     pages = batch * pages_per_row
-    query = torch.randn(batch, HEADS, LATENT, dtype=torch.bfloat16, device="npu")
+    query = torch.randn(batch, heads, LATENT, dtype=torch.bfloat16, device="npu")
     sparse_indices = torch.arange(TOPK, dtype=torch.int32, device="npu").view(1, 1, TOPK).repeat(batch, 1, 1)
     block_table = torch.arange(pages, dtype=torch.int32, device="npu").view(batch, pages_per_row)
     actual_query = torch.arange(1, batch + 1, dtype=torch.int32, device="npu")
     actual_kv = torch.full((batch,), TOPK, dtype=torch.int32, device="npu")
     keys = [torch.randn(pages, BLOCK, 1, LATENT, dtype=torch.bfloat16, device="npu") for _ in range(k)]
     key_ropes = [torch.randn(pages, BLOCK, 1, ROPE, dtype=torch.bfloat16, device="npu") for _ in range(k)]
-    query_ropes = [torch.randn(batch, HEADS, ROPE, dtype=torch.bfloat16, device="npu") for _ in range(k)]
+    query_ropes = [torch.randn(batch, heads, ROPE, dtype=torch.bfloat16, device="npu") for _ in range(k)]
     graph = torch.npu.NPUGraph()
     with torch.inference_mode(), torch.npu.graph(graph):
         for layer in range(k):
@@ -65,6 +65,12 @@ def make_sfa_graph(batch: int, k: int):
                 return_softmax_lse=False,
             )
             query = result[0] if isinstance(result, tuple) else result
+            if comm_group is not None:
+                # The production row-parallel o_proj reduces b x 7168 BF16
+                # activations. Use a contiguous output view of equal size to
+                # isolate the collective cost without adding a projection.
+                payload = query.reshape(-1)[:batch * HIDDEN]
+                dist.all_reduce(payload, group=comm_group)
     keepalive = [sparse_indices, block_table, actual_query, actual_kv, keys, key_ropes, query_ropes]
     return graph, query, keepalive, batch
 

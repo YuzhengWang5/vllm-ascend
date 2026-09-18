@@ -75,6 +75,7 @@ def main():
                 raise RuntimeError(f"expected A3 die 0..15; saw {sorted(usage)}")
             stream.write(json.dumps({
                 "stage": before["stage"], "batch": before["batch"],
+                "mode": before["mode"],
                 "monotonic_start": started, "monotonic_end": ended,
                 "aicore_percent_by_die": usage,
                 "processes": processes,
