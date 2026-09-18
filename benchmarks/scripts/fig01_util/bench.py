@@ -193,7 +193,7 @@ def run_point(args, batch: int, rank: int, moe_state, marker: Path):
     # duration even when another rank is slower.
     min_ms = torch.tensor(local_graph_ms, dtype=torch.float32, device="npu")
     dist.all_reduce(min_ms, op=dist.ReduceOp.MIN)
-    target_replays = max(2048, math.ceil(args.seconds * 1.1 * 1000 / float(min_ms)))
+    target_replays = max(64, math.ceil(args.seconds * 1.1 * 1000 / float(min_ms)))
     target_replays = min(target_replays, args.max_replays)
     dist.barrier()
 
@@ -205,10 +205,23 @@ def run_point(args, batch: int, rank: int, moe_state, marker: Path):
     stop = torch.npu.Event(enable_timing=True)
     wall_start = time.monotonic()
     start.record()
-    for i in range(target_replays):
-        graph.replay()
-        if (i + 1) % 128 == 0:
-            torch.npu.synchronize()
+    completed_replays = 0
+    next_chunk = target_replays
+    while True:
+        for i in range(next_chunk):
+            graph.replay()
+            if (i + 1) % 128 == 0:
+                torch.npu.synchronize()
+        torch.npu.synchronize()
+        completed_replays += next_chunk
+        # All ranks must replay the same number of graphs. Extend in common
+        # chunks if the pilot overestimated steady-state latency.
+        minimum_wall = torch.tensor(time.monotonic() - wall_start,
+                                    dtype=torch.float32, device="npu")
+        dist.all_reduce(minimum_wall, op=dist.ReduceOp.MIN)
+        if float(minimum_wall.item()) >= args.seconds:
+            break
+        next_chunk = 128
     stop.record()
     stop.synchronize()
     wall_end = time.monotonic()
@@ -219,7 +232,7 @@ def run_point(args, batch: int, rank: int, moe_state, marker: Path):
     record = {
         "stage": args.stage, "batch": batch, "rank": rank,
         "mode": args.mode,
-        "status": "pass", "graph_replays": target_replays,
+        "status": "pass", "graph_replays": completed_replays,
         "pilot_ms_per_graph": local_graph_ms,
         "device_ms_total": device_ms,
         "wall_seconds": wall_end - wall_start,
