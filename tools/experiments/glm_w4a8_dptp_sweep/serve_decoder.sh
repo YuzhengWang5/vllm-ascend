@@ -26,6 +26,14 @@ if (( dp_size * tp_size != 16 )); then
     echo "DP*TP must equal the 16 decoder dies" >&2
     exit 2
 fi
+if [[ ${variant} == iaas ]]; then
+    kv_bytes=$((iaas_blocks * 78 * 128 * (512 + 64) * 2))
+    pool_bytes=$((dram_gib_per_dp * 1024 * 1024 * 1024))
+    if (( kv_bytes > pool_bytes )); then
+        echo "IaaS MLA KV requires ${kv_bytes} bytes but DRAM pool is only ${pool_bytes} bytes per DP" >&2
+        exit 2
+    fi
+fi
 run_dir=${GLM_RUN_DIR:?set GLM_RUN_DIR to run path inside container}
 source_dir=/workspace/src/worktrees/glm-w4a8-dptp
 model=/workspace/exps/20260915_102819_glm5_w4a8_dp16_ep16/runs/20260915_102819_glm5_w4a8_dp16_ep16/logs/model_mount
