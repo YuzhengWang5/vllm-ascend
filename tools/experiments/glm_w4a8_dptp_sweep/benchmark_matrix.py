@@ -17,8 +17,8 @@ import aiohttp
 
 CONTEXTS = (32 * 1024, 64 * 1024, 128 * 1024)
 BATCHES = (16, 32, 48, 64)
-WARMUP_TOKENS = 50
-MEASURE_TOKENS = 200
+WARMUP_TOKENS = 100
+MEASURE_TOKENS = 150
 MAX_TOKENS = WARMUP_TOKENS + MEASURE_TOKENS
 BLOCK_SIZE = 128
 MLA_KV_BYTES_PER_TOKEN = 78 * (512 + 64) * 2
@@ -95,6 +95,23 @@ async def one_request(
     }
 
 
+def steady_window(request: dict[str, Any]) -> tuple[float, list[float], list[float]]:
+    """Measure only tokens that arrived after the warmup token's SSE event."""
+    stamps = request["token_timestamps"]
+    boundary = stamps[WARMUP_TOKENS - 1]
+    measured = [stamp for stamp in stamps[WARMUP_TOKENS:] if stamp > boundary]
+    if len(measured) < 130:
+        raise RuntimeError(
+            f"only {len(measured)} steady tokens after warmup boundary for "
+            f"request {request['request_id']}"
+        )
+    intervals_ms = [
+        (right - left) * 1000
+        for left, right in zip([boundary] + measured[:-1], measured)
+    ]
+    return boundary, measured, intervals_ms
+
+
 async def run_attempt(
     session: aiohttp.ClientSession,
     args: argparse.Namespace,
@@ -116,34 +133,35 @@ async def run_attempt(
     if lengths != [MAX_TOKENS] * batch:
         raise RuntimeError(f"token count mismatch: {lengths}")
 
-    boundaries = [request["token_timestamps"][WARMUP_TOKENS - 1] for request in requests]
-    ends = [request["token_timestamps"][-1] for request in requests]
-    intervals_ms = [
-        (right - left) * 1000
-        for request in requests
-        for left, right in zip(
-            request["token_timestamps"][WARMUP_TOKENS - 1 :],
-            request["token_timestamps"][WARMUP_TOKENS :],
-        )
-    ]
+    windows = [steady_window(request) for request in requests]
+    boundaries = [window[0] for window in windows]
+    ends = [window[1][-1] for window in windows]
+    intervals_ms = [interval for window in windows for interval in window[2]]
+    measured_count = sum(len(window[1]) for window in windows)
     duration_s = max(ends) - min(boundaries)
     per_dp_rates = []
     for dp_rank in range(args.dp_size):
-        dp_requests = [r for r in requests if r["request_id"] % args.dp_size == dp_rank]
-        dp_start = min(r["token_timestamps"][WARMUP_TOKENS - 1] for r in dp_requests)
-        dp_end = max(r["token_timestamps"][-1] for r in dp_requests)
-        per_dp_rates.append(len(dp_requests) * MEASURE_TOKENS / (dp_end - dp_start))
+        dp_windows = [
+            window for request, window in zip(requests, windows)
+            if request["request_id"] % args.dp_size == dp_rank
+        ]
+        dp_start = min(window[0] for window in dp_windows)
+        dp_end = max(window[1][-1] for window in dp_windows)
+        per_dp_rates.append(sum(len(window[1]) for window in dp_windows) / (dp_end - dp_start))
     overlap_start = max(boundaries)
     overlap_end = min(ends)
     overlap_duration_s = max(0.0, overlap_end - overlap_start)
     overlap_tokens = sum(
         overlap_start < timestamp <= overlap_end
-        for request in requests
-        for timestamp in request["token_timestamps"][WARMUP_TOKENS:]
+        for window in windows
+        for timestamp in window[1]
     )
     return {
         "attempt": attempt,
-        "throughput_tok_s": batch * MEASURE_TOKENS / duration_s,
+        "throughput_tok_s": measured_count / duration_s,
+        "measured_tokens": measured_count,
+        "min_measured_tokens_per_request": min(len(window[1]) for window in windows),
+        "max_measured_tokens_per_request": max(len(window[1]) for window in windows),
         "per_dp_sum_throughput_tok_s": sum(per_dp_rates),
         "per_dp_throughput_tok_s": per_dp_rates,
         "overlap_throughput_tok_s": (
@@ -188,13 +206,10 @@ async def run_point(
         if item["overlap_throughput_tok_s"] is not None
     ]
     all_intervals = [
-        (right - left) * 1000
+        interval
         for item in repeats
         for request in item["requests"]
-        for left, right in zip(
-            request["token_timestamps"][WARMUP_TOKENS - 1 :],
-            request["token_timestamps"][WARMUP_TOKENS :],
-        )
+        for interval in steady_window(request)[2]
     ]
     return {
         "status": "ok",
@@ -213,6 +228,7 @@ async def run_point(
         "local_batch_per_dp": batch // args.dp_size,
         "warmup_tokens": WARMUP_TOKENS,
         "measure_tokens": MEASURE_TOKENS,
+        "measurement_policy": "count only tokens strictly after token 100 timestamp",
         "repeats": repeats,
         "rejected_repeats": rejected,
         "aggregate": {
