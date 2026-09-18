@@ -36,7 +36,9 @@ def parse_processes(output: str) -> list[dict]:
         identifiers = fields[1].split()
         if len(identifiers) != 2 or not all(value.isdigit() for value in identifiers):
             continue
-        processes.append({"die": int(identifiers[1]),
+        # The process table uses package ID plus local chip 0/1, whereas the
+        # status table above prints the physical die ID 0..15 directly.
+        processes.append({"die": 2 * int(identifiers[0]) + int(identifiers[1]),
                           "pid": int(fields[2].strip()),
                           "name": fields[3].strip()})
     return processes
