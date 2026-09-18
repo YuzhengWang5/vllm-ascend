@@ -33,6 +33,7 @@ def main():
                                 and r.get("batch") == batch and r.get("status") == "pass"]
                 assert len(measurements) == ranks, (stage, mode, batch, len(measurements))
                 assert {r["rank"] for r in measurements} == set(range(ranks))
+                assert min(r["wall_seconds"] for r in measurements) >= 15, (stage, mode, batch)
                 points = [s for s in samples if s.get("stage") == stage
                           and s.get("mode") == mode and s.get("batch") == batch]
                 assert len(points) >= 6, (stage, mode, batch, len(points))

@@ -37,6 +37,7 @@ def main():
                          and r.get("batch") == batch and r.get("status") == "pass"]
             assert len(rank_runs) == 16, (stage, batch, len(rank_runs))
             assert {r["rank"] for r in rank_runs} == set(range(16)), (stage, batch)
+            assert min(r["wall_seconds"] for r in rank_runs) >= 15, (stage, batch)
             replays = {r["graph_replays"] for r in rank_runs}
             assert len(replays) == 1, (stage, batch, replays)
             points = [s for s in samples if s["stage"] == stage and s["batch"] == batch
