@@ -12,6 +12,11 @@ iaas_blocks=${GLM_IAAS_BLOCKS:-4300}
 hbm_util=${GLM_HBM_UTIL:-0.92}
 remote_host=${GLM_REMOTE_HOST:-7.150.13.62}
 remote_store_port=${GLM_REMOTE_STORE_PORT:-29740}
+remote_profile_device=${GLM_REMOTE_PROFILE_DEVICE:-0}
+if [[ ${remote_profile_device} != 0 && ${remote_profile_device} != 1 ]]; then
+    echo "GLM_REMOTE_PROFILE_DEVICE must be 0 or 1" >&2
+    exit 2
+fi
 if ! [[ ${dp_size} =~ ^[1-9][0-9]*$ && ${tp_size} =~ ^[1-9][0-9]*$ && ${max_local_batch} =~ ^[1-9][0-9]*$ && ${dram_gib_per_dp} =~ ^[1-9][0-9]*$ && ${iaas_blocks} =~ ^[1-9][0-9]*$ ]]; then
     echo "DP, TP, max local batch, DRAM GiB and IaaS blocks must be positive integers" >&2
     exit 2
@@ -72,11 +77,11 @@ if [[ ${variant} == iaas ]]; then
         'from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.indexer_shm_transport import _load_extension; _load_extension()'
 fi
 
-additional_config=$(/usr/local/python3.12.13/bin/python3 - "${variant}" "${gate}" "${dram_gib_per_dp}" "${remote_host}" "${remote_store_port}" <<'PY'
+additional_config=$(/usr/local/python3.12.13/bin/python3 - "${variant}" "${gate}" "${dram_gib_per_dp}" "${remote_host}" "${remote_store_port}" "${remote_profile_device}" <<'PY'
 import json
 import sys
 
-variant, gate, dram_gib_per_dp, remote_host, remote_store_port = sys.argv[1:]
+variant, gate, dram_gib_per_dp, remote_host, remote_store_port, remote_profile_device = sys.argv[1:]
 config = {
     "enable_cpu_binding": True,
     "enable_sparse_li_c8": False,
@@ -107,7 +112,7 @@ if variant == "iaas":
         "remote_indexer_host": remote_host,
         "remote_indexer_transport": "shm",
         "remote_indexer_shm_store": f"tcp://{remote_host}:{remote_store_port}",
-        "remote_indexer_profile_device": False,
+        "remote_indexer_profile_device": remote_profile_device == "1",
         "remote_indexer_direct_pack": True,
         "remote_indexer_share_within_tp": True,
         "remote_indexer_gva_tp_fanout": True,

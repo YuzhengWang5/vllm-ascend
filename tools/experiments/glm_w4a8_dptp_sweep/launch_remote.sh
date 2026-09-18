@@ -7,6 +7,7 @@ tp_size=${GLM_TP_SIZE:?set GLM_TP_SIZE}
 max_local_batch=${GLM_MAX_LOCAL_BATCH:-4}
 bucket_spec=${GLM_BUCKETS:-}
 iaas_blocks=${GLM_IAAS_BLOCKS:-4300}
+profile_device_breakdown=${GLM_PROFILE_DEVICE_BREAKDOWN:-0}
 if ! [[ ${dp_size} =~ ^[1-9][0-9]*$ && ${tp_size} =~ ^[1-9][0-9]*$ && ${max_local_batch} =~ ^[1-9][0-9]*$ && ${iaas_blocks} =~ ^[1-9][0-9]*$ ]]; then
     echo "DP, TP, max local batch and IaaS blocks must be positive integers" >&2
     exit 2
@@ -14,6 +15,14 @@ fi
 if (( dp_size * tp_size != 16 )); then
     echo "DP*TP must equal 16" >&2
     exit 2
+fi
+if [[ ${profile_device_breakdown} != 0 && ${profile_device_breakdown} != 1 ]]; then
+    echo "GLM_PROFILE_DEVICE_BREAKDOWN must be 0 or 1" >&2
+    exit 2
+fi
+profile_args=
+if [[ ${profile_device_breakdown} == 1 ]]; then
+    profile_args='--profile-device-breakdown --profile-log-every 8'
 fi
 if [[ -n ${bucket_spec} ]]; then
     service_batches=${bucket_spec//,/ }
@@ -63,7 +72,7 @@ for ((rank=0; rank<dp_size; rank++)); do
              --cache-blocks ${iaas_blocks} --block-size 128 --block-table-cols 1026 \
              --metadata-once-per-step --dynamic-batch-by-request-bytes \
              --service-managed-resident --synthetic-oracle-topk \
-             --forced-resident-miss-count 819 --log-every 64 \
+             --forced-resident-miss-count 819 ${profile_args} --log-every 64 \
              --pid-file /tmp/glm_sweep_${attempt_tag}_rank${rank}.pid \
              > /tmp/glm_sweep_${attempt_tag}_rank${rank}.log 2>&1'"
 done
