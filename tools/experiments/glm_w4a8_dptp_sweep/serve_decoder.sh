@@ -128,6 +128,11 @@ PY
 )
 
 hf_overrides='{"use_index_cache":true,"index_topk_freq":1}'
+load_strategy=${GLM_SAFETENSORS_LOAD_STRATEGY:-prefetch}
+case "${load_strategy}" in
+    lazy|eager|prefetch|torchao) ;;
+    *) echo "unsupported safetensors load strategy: ${load_strategy}" >&2; exit 2 ;;
+esac
 kv_transfer_config='{"kv_connector":"SFAOffloadDecodeBenchConnector","kv_role":"kv_consumer","kv_connector_extra_config":{"main_fill_value":0.015,"indexer_fill_value":1,"indexer_scale_value":0.015,"fill_std":0.0}}'
 block_args=()
 if [[ ${variant} == iaas ]]; then
@@ -154,7 +159,7 @@ if not buckets or buckets != sorted(set(buckets)) or buckets[0] != 1 or buckets[
 print(json.dumps({"cudagraph_mode": "FULL_DECODE_ONLY", "cudagraph_capture_sizes": buckets}))
 PY
 )
-echo "GLM sweep setup: variant=${variant} dp=${dp_size} tp=${tp_size} local_batch=${max_local_batch} dram_gib_per_dp=${dram_gib_per_dp} iaas_blocks=${iaas_blocks} hbm_util=${hbm_util} capture=${capture_sizes}"
+echo "GLM sweep setup: variant=${variant} dp=${dp_size} tp=${tp_size} local_batch=${max_local_batch} dram_gib_per_dp=${dram_gib_per_dp} iaas_blocks=${iaas_blocks} hbm_util=${hbm_util} load_strategy=${load_strategy} capture=${capture_sizes}"
 
 exec /usr/local/python3.12.13/bin/vllm serve "${model}" \
   --served-model-name GLM-5 \
@@ -165,7 +170,7 @@ exec /usr/local/python3.12.13/bin/vllm serve "${model}" \
   --max-num-seqs "${max_local_batch}" --max-model-len 131322 --max-num-batched-tokens "${max_local_batch}" \
   --block-size 128 --gpu-memory-utilization "${hbm_util}" \
   --no-enable-prefix-caching --no-async-scheduling \
-  --safetensors-load-strategy prefetch \
+  --safetensors-load-strategy "${load_strategy}" \
   --hf-overrides "${hf_overrides}" \
   --additional-config "${additional_config}" \
   --kv-transfer-config "${kv_transfer_config}" \
