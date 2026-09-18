@@ -83,8 +83,9 @@ def make_dense_graph(batch: int, prefix: int, calls: int = 8):
     blocks_per_row = prefix // BLOCK
     blocks = batch * blocks_per_row
     block_table = torch.arange(blocks, dtype=torch.int32, device="npu").view(batch, blocks_per_row)
-    key = torch.randn((blocks, BLOCK, 1, LATENT), dtype=torch.bfloat16, device="npu")
-    key_rope = torch.randn((blocks, BLOCK, 1, ROPE), dtype=torch.bfloat16, device="npu")
+    # FIA v2 page layout is [physical block, KV heads, block size, dim].
+    key = torch.randn((blocks, 1, BLOCK, LATENT), dtype=torch.bfloat16, device="npu")
+    key_rope = torch.randn((blocks, 1, BLOCK, ROPE), dtype=torch.bfloat16, device="npu")
     queries = [torch.randn((batch, HEADS, 1, LATENT), dtype=torch.bfloat16, device="npu")
                for _ in range(calls)]
     query_ropes = [torch.randn((batch, HEADS, 1, ROPE), dtype=torch.bfloat16, device="npu")
