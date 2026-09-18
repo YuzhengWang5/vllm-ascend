@@ -168,8 +168,34 @@ def serve(args: argparse.Namespace) -> None:
         decoder_rank=args.decoder_rank,
         service_rank=args.global_rank,
     )
+    allocated_before_cache = torch.npu.memory_allocated()
+    reserved_before_cache = torch.npu.memory_reserved()
     caches = [make_cache(args) for _ in range(args.layers)]
     torch.npu.synchronize()
+    index_tensor_bytes = sum(
+        tensor.numel() * tensor.element_size()
+        for key, scale in caches
+        for tensor in (key, scale)
+        if tensor is not None
+    )
+    print(
+        json.dumps(
+            {
+                "event": "index_hbm_allocated",
+                "global_rank": args.global_rank,
+                "cache_blocks": args.cache_blocks,
+                "block_size": args.block_size,
+                "layers": args.layers,
+                "index_dtype": args.index_dtype,
+                "index_tensor_bytes": index_tensor_bytes,
+                "torch_allocated_before_cache_bytes": allocated_before_cache,
+                "torch_allocated_after_cache_bytes": torch.npu.memory_allocated(),
+                "torch_reserved_before_cache_bytes": reserved_before_cache,
+                "torch_reserved_after_cache_bytes": torch.npu.memory_reserved(),
+            }
+        ),
+        flush=True,
+    )
 
     requests: dict[int, PackedTensors] = {}
     data_requests: dict[int, PackedTensors] = {}
@@ -296,6 +322,10 @@ def serve(args: argparse.Namespace) -> None:
                 "response_bytes": {batch: responses[batch].numel() for batch in args.batches},
                 "service_managed_resident": args.service_managed_resident,
                 "index_dtype": args.index_dtype,
+                "cache_blocks": args.cache_blocks,
+                "index_tensor_bytes": index_tensor_bytes,
+                "torch_allocated_after_graphs_bytes": torch.npu.memory_allocated(),
+                "torch_reserved_after_graphs_bytes": torch.npu.memory_reserved(),
                 "synthetic_oracle_topk": args.synthetic_oracle_topk,
                 "forced_resident_miss_count": args.forced_resident_miss_count,
             }
