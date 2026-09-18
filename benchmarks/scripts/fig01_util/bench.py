@@ -32,7 +32,7 @@ from vllm_ascend.utils import enable_custom_op
 BLOCK = 128
 INDEX_HEADS = 64
 INDEX_DIM = 128
-HEADS = 128
+HEADS = 16  # DeepSeek-V3.2: 128 attention heads / TP8 per die.
 LATENT = 512
 ROPE = 64
 BATCHES = (4, 8, 12, 16, 24, 32, 48, 64, 96, 128)

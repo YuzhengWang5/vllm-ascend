@@ -21,7 +21,7 @@ from vllm_ascend.ops.triton.triton_utils import init_device_properties_triton
 from vllm_ascend.utils import ACL_FORMAT_FRACTAL_NZ, enable_custom_op
 
 
-HEADS = 128
+HEADS = 16  # DeepSeek-V3.2: 128 attention heads / TP8 per die.
 LATENT = 512
 ROPE = 64
 TOPK = 2048
