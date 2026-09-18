@@ -188,9 +188,12 @@ def run_point(args, batch: int, rank: int, moe_state, marker: Path):
     stop.record()
     stop.synchronize()
     local_graph_ms = start.elapsed_time(stop) / args.pilot_replays
-    max_ms = torch.tensor(local_graph_ms, dtype=torch.float32, device="npu")
-    dist.all_reduce(max_ms, op=dist.ReduceOp.MAX)
-    target_replays = max(2048, math.ceil(args.seconds * 1000 / float(max_ms)))
+    # Pilot rank maxima can be inflated by one-time HCCL scheduling. Use the
+    # fastest measured rank so the steady-state window is at least the target
+    # duration even when another rank is slower.
+    min_ms = torch.tensor(local_graph_ms, dtype=torch.float32, device="npu")
+    dist.all_reduce(min_ms, op=dist.ReduceOp.MIN)
+    target_replays = max(2048, math.ceil(args.seconds * 1.1 * 1000 / float(min_ms)))
     target_replays = min(target_replays, args.max_replays)
     dist.barrier()
 
