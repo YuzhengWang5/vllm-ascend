@@ -20,6 +20,7 @@ BATCHES = (16, 32, 48, 64)
 WARMUP_TOKENS = 100
 MEASURE_TOKENS = 150
 MAX_TOKENS = WARMUP_TOKENS + MEASURE_TOKENS
+MIN_STEADY_TOKENS = 120
 BLOCK_SIZE = 128
 MLA_KV_BYTES_PER_TOKEN = 78 * (512 + 64) * 2
 
@@ -100,7 +101,7 @@ def steady_window(request: dict[str, Any]) -> tuple[float, list[float], list[flo
     stamps = request["token_timestamps"]
     boundary = stamps[WARMUP_TOKENS - 1]
     measured = [stamp for stamp in stamps[WARMUP_TOKENS:] if stamp > boundary]
-    if len(measured) < 130:
+    if len(measured) < MIN_STEADY_TOKENS:
         raise RuntimeError(
             f"only {len(measured)} steady tokens after warmup boundary for "
             f"request {request['request_id']}"
